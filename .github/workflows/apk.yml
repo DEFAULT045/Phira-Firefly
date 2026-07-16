@@ -1,0 +1,50 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch: # 支持在 Actions 页面手动点击运行
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java (JDK 17)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi
+
+      - name: Build APK with Gradle
+        run: |
+          # 自动寻找项目中的 Gradle 编译器并执行打包
+          if [ -f "gradlew" ]; then
+            chmod +x gradlew
+            ./gradlew assembleRelease || ./gradlew assembleDebug
+          elif [ -f "android/gradlew" ]; then
+            cd android
+            chmod +x gradlew
+            ./gradlew assembleRelease || ./gradlew assembleDebug
+          else
+            echo "错误：未找到 gradlew 编译文件！"
+            exit 1
+          fi
+
+          # 移动打包好的 APK 到根目录方便收集
+          mkdir -p ../output_apk
+          find . -name "*.apk" -exec cp {} ../output_apk/ \; 2>/dev/null || true
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Phira-Firefly-APK
+          path: |
+            output_apk/*.apk
+            **/build/outputs/apk/**/*.apk
