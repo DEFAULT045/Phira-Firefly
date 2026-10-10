@@ -7,6 +7,39 @@ use serde::{Deserialize, Serialize};
 
 pub static TIPS: Lazy<Vec<String>> = Lazy::new(|| include_str!("tips.txt").split('\n').map(str::to_owned).collect());
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum DynamicBackgroundMode {
+    #[default]
+    Off,
+    StaticBrightness,
+    DynamicBrightness,
+}
+
+/// Rendering backend selection.
+///
+/// - `Auto`: prefer wgpu (Vulkan/Metal/DX12), fall back to OpenGL ES.
+/// - `Wgpu`: force the wgpu backend (Vulkan on Android/Windows).
+/// - `OpenGl`: force the legacy macroquad/OpenGL ES backend.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum RenderBackend {
+    #[default]
+    Auto,
+    Wgpu,
+    OpenGl,
+}
+
+impl DynamicBackgroundMode {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::StaticBrightness => 1,
+            Self::DynamicBrightness => 2,
+        }
+    }
+}
+
 bitflags! {
     #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, Debug)]
     #[serde(transparent)]
@@ -20,6 +53,7 @@ bitflags! {
         const NO_SHADER = 0x0040;
         const INSTANT_DEATH_AP = 0x0080;
         const INSTANT_DEATH_FC = 0x0100;
+        const HEALTH_BAR = 0x0200;
 
         const UNRATED = Self::AUTOPLAY.bits() | Self::NO_SHADER.bits();
     }
@@ -47,6 +81,12 @@ impl Mods {
     }
 }
 
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq, Debug)]
+pub struct MpServer {
+    pub name: String,
+    pub address: String,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default)]
 #[serde(rename_all = "camelCase")]
@@ -60,12 +100,15 @@ pub struct Config {
     pub chart_debug: bool,
     pub disable_effect: bool,
     pub double_click_to_pause: bool,
+    pub dynamic_background: DynamicBackgroundMode,
     pub double_hint: bool,
     pub fullscreen_mode: bool,
     pub fxaa: bool,
     pub interactive: bool,
     pub mods: Mods,
     pub mp_address: String,
+    #[serde(default)]
+    pub mp_servers: Vec<MpServer>,
     pub mp_enabled: bool,
     pub note_scale: f32,
     pub offline_mode: bool,
@@ -75,15 +118,39 @@ pub struct Config {
     pub player_rks: f32,
     pub preferred_sample_rate: Option<u32>,
     pub res_pack_path: Option<String>,
+    pub render_backend: RenderBackend,
+    #[serde(default)]
+    pub smtc_integration: bool,
     pub sample_count: u32,
     pub show_acc: bool,
     pub show_avg_fps: bool,
+    pub performance_monitor: bool,
     pub speed: f32,
     pub touch_debug: bool,
     pub use_keyboard: bool,
     pub volume_bgm: f32,
     pub volume_music: f32,
     pub volume_sfx: f32,
+    pub vsync: bool,
+
+    /// XC-SIM chart server base URL (empty = use the built-in default).
+    #[serde(default)]
+    pub xcsim_server: String,
+
+    /// Whether to automatically record a replay file for each play.
+    pub auto_record: bool,
+
+    /// Whether to show the console window at startup. Windows only.
+    #[serde(default)]
+    pub debug_console: bool,
+
+    /// Whether to show an in-game overlay of recent log messages.
+    #[serde(default)]
+    pub log_overlay: bool,
+
+    /// Whether to run the arcade-style hardware/file self test before boot.
+    #[serde(default)]
+    pub startup_post: bool,
 
     // for compatibility
     autoplay: Option<bool>,
@@ -100,11 +167,16 @@ impl Default for Config {
             chart_debug: false,
             disable_effect: false,
             double_click_to_pause: true,
+            dynamic_background: DynamicBackgroundMode::Off,
             double_hint: true,
             fxaa: false,
             interactive: true,
             mods: Mods::default(),
             mp_address: "mp2.phira.cn:12345".to_owned(),
+            mp_servers: vec![MpServer {
+                name: "mp2.phira.cn:12345".to_owned(),
+                address: "mp2.phira.cn:12345".to_owned(),
+            }],
             mp_enabled: false,
             note_scale: 1.0,
             offline_mode: false,
@@ -115,15 +187,27 @@ impl Default for Config {
             player_rks: 15.,
             preferred_sample_rate: None,
             res_pack_path: None,
+            render_backend: RenderBackend::default(),
+            smtc_integration: false,
             sample_count: 1,
             show_acc: false,
             show_avg_fps: false,
+            performance_monitor: false,
             speed: 1.,
             touch_debug: false,
             use_keyboard: false,
             volume_music: 1.,
             volume_sfx: 1.,
             volume_bgm: 1.,
+            vsync: false,
+
+            xcsim_server: String::new(),
+
+            auto_record: true,
+
+            debug_console: false,
+            log_overlay: false,
+            startup_post: false,
 
             autoplay: None,
         }
@@ -134,6 +218,14 @@ impl Config {
     pub fn init(&mut self) {
         if let Some(flag) = self.autoplay {
             self.mods.set(Mods::AUTOPLAY, flag);
+        }
+        if self.mp_servers.is_empty() && !self.mp_address.is_empty() {
+            self.mp_servers.push(MpServer {
+                name: self.mp_address.clone(),
+                address: self.mp_address.clone(),
+            });
+        } else if !self.mp_address.is_empty() && !self.mp_servers.iter().any(|server| server.address == self.mp_address) {
+            self.mp_address.clone_from(&self.mp_servers[0].address);
         }
         #[cfg(target_env = "ohos")]
         {
@@ -155,5 +247,46 @@ impl Config {
     #[inline]
     pub fn flip_x(&self) -> bool {
         self.has_mod(Mods::FLIP_X)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn default_config_stores_its_multiplayer_server() {
+        let config = Config::default();
+
+        assert_eq!(config.mp_servers.len(), 1);
+        assert_eq!(config.mp_servers[0].name, config.mp_address);
+        assert_eq!(config.mp_servers[0].address, config.mp_address);
+    }
+
+    #[test]
+    fn migrates_legacy_multiplayer_address() {
+        let mut config: Config = serde_json::from_str(r#"{"mpAddress":"example.com:12345"}"#).unwrap();
+
+        config.init();
+
+        assert_eq!(config.mp_servers.len(), 1);
+        assert_eq!(config.mp_servers[0].name, "example.com:12345");
+        assert_eq!(config.mp_servers[0].address, "example.com:12345");
+    }
+
+    #[test]
+    fn preserves_an_intentionally_empty_multiplayer_server_list() {
+        let mut config: Config = serde_json::from_str(r#"{"mpAddress":"","mpServers":[]}"#).unwrap();
+
+        config.init();
+
+        assert!(config.mp_servers.is_empty());
+        assert!(config.mp_address.is_empty());
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        let mut restored: Config = serde_json::from_str(&serialized).unwrap();
+        restored.init();
+        assert!(restored.mp_servers.is_empty());
+        assert!(restored.mp_address.is_empty());
     }
 }

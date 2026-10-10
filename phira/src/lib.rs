@@ -7,21 +7,28 @@ mod inner;
 mod anim;
 mod charts_view;
 mod client;
+mod crash;
 mod data;
 mod icons;
 mod images;
+#[cfg(feature = "intest")]
+mod intest;
+#[cfg(feature = "testing")]
+mod lan;
 mod login;
 mod mp;
 mod page;
 mod popup;
 mod rate;
+#[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32", target_env = "ohos")))]
+pub mod render_worker;
 mod resource;
 mod scene;
 mod tabs;
 mod tags;
+mod theme;
 mod threed;
 mod uml;
-mod crash;
 
 use anyhow::Result;
 use core::f64;
@@ -38,7 +45,7 @@ use prpr::{
     Main,
 };
 use prpr_l10n::{set_prefered_locale, GLOBAL, LANGS};
-use scene::MainScene;
+use scene::BootScene;
 use std::{
     collections::VecDeque,
     sync::{mpsc, Mutex},
@@ -49,7 +56,7 @@ use tracing::{error, info};
 use jni::{
     objects::{JClass, JString},
     sys::jint,
-    EnvUnowned,
+    EnvUnowned, Outcome,
 };
 
 #[cfg(target_os = "android")]
@@ -63,13 +70,14 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_preprocessInput(
     #[allow(dead_code)] z: miniquad::native::ndk_sys::jboolean,
     #[allow(dead_code)] z2: miniquad::native::ndk_sys::jboolean,
 ) {
-
 }
 
 static MESSAGES_TX: Mutex<Option<mpsc::Sender<bool>>> = Mutex::new(None);
 static AA_TX: Mutex<Option<mpsc::Sender<i32>>> = Mutex::new(None);
 static DATA_PATH: Mutex<Option<String>> = Mutex::new(None);
 static CACHE_DIR: Mutex<Option<String>> = Mutex::new(None);
+#[cfg(target_os = "android")]
+static STARTUP_ARGS: Mutex<Option<(Option<String>, Option<String>, Option<String>)>> = Mutex::new(None);
 pub static mut DATA: Option<Data> = None;
 
 #[cfg(target_env = "ohos")]
@@ -94,18 +102,16 @@ pub async fn load_res_tex(name: &str) -> SafeTexture {
 }
 
 pub fn sync_data() {
-    let locale = get_data().language.as_ref().and_then(|it| {
-        if it == "zh-LZH" {
-            "lzh".parse().ok()
-        } else {
-            it.parse().ok()
-        }
-    });
+    let locale = get_data()
+        .language
+        .as_ref()
+        .and_then(|it| if it == "zh-LZH" { "lzh".parse().ok() } else { it.parse().ok() });
     set_prefered_locale(locale);
     if get_data().language.is_none() {
         get_data_mut().language = Some(LANGS[GLOBAL.order.lock().unwrap()[0]].to_owned());
     }
     let _ = client::set_access_token_sync(get_data().tokens.as_ref().map(|it| &*it.0));
+    let _ = client::xcsim::set_token_sync(get_data().xcsim_token.as_ref().map(|it| &*it.0));
 }
 
 pub fn set_data(data: Data) {
@@ -138,12 +144,17 @@ mod dir {
         let base = DATA_PATH.lock().unwrap().as_ref().map(|it| it.to_string());
         #[cfg(target_os = "android")]
         let base = base.or_else(|| {
-            std::env::var("TMPDIR").ok().map(|tmpdir| {
-                tmpdir.trim_end_matches("/cache").to_string() + "/files"
-            })
+            std::env::var("TMPDIR")
+                .ok()
+                .map(|tmpdir| tmpdir.trim_end_matches("/cache").to_string() + "/files")
         });
         let base = base.unwrap_or_else(|| ".".to_string());
-        let s = format!("{}/{}", base, s);
+        // 绝对路径（如 CACHE_DIR）直接使用，避免被错误拼到 DATA_PATH 下
+        let s = if std::path::Path::new(s).is_absolute() {
+            s.to_string()
+        } else {
+            format!("{}/{}", base, s)
+        };
         let path = std::path::Path::new(&s);
         if !path.exists() {
             std::fs::create_dir_all(path)?;
@@ -190,6 +201,28 @@ mod dir {
     pub fn respacks() -> Result<String> {
         ensure("data/respack")
     }
+
+    pub fn replays() -> Result<String> {
+        ensure("data/replays")
+    }
+
+    pub fn themes() -> Result<String> {
+        ensure("data/themes")
+    }
+}
+
+/// 加载崩溃界面字体。优先使用 font.ttf，缺失时回退到随包自带的其他 TTF 字体，
+/// 确保即使主字体缺失，崩溃界面也能以非位图字体正常显示。
+async fn load_crash_font() -> Option<macroquad::text::Font> {
+    for name in ["font.ttf", "bold.ttf", "halva.ttf", "phigros.ttf"] {
+        if let Ok(bytes) = load_file(name).await {
+            if let Ok(font) = macroquad::text::load_ttf_font_from_bytes(&bytes) {
+                info!("crash font loaded: {name}");
+                return Some(font);
+            }
+        }
+    }
+    None
 }
 
 async fn the_main() -> Result<()> {
@@ -231,9 +264,14 @@ async fn the_main() -> Result<()> {
     sync_data();
     save_data()?;
 
+    // 初始化渲染后端（wgpu/Vulkan 或 OpenGL 兜底）
+    let selected_backend = get_data().config.render_backend;
+    prpr::render_backend::init_render_backend(selected_backend);
+
     #[cfg(target_os = "windows")]
     {
         macroquad::window::set_fullscreen(get_data().config.fullscreen_mode);
+        prpr::set_swap_interval(if get_data().config.vsync { 1 } else { 0 });
     }
 
     let rx = {
@@ -262,8 +300,7 @@ async fn the_main() -> Result<()> {
 
     let font = FontArc::try_from_vec(load_file("font.ttf").await?)?;
     let mut painter = TextPainter::new(font.clone(), None);
-    let mut crash_painter = TextPainter::new(font.clone(), None);
-    let crash_logo = match load_texture("crashlogo.png").await {
+    let mut crash_logo: Option<Texture2D> = match load_texture("crashlogo.png").await {
         Ok(tex) => {
             info!("crash logo loaded: {}x{}", tex.width(), tex.height());
             Some(tex)
@@ -283,8 +320,31 @@ async fn the_main() -> Result<()> {
             }
         }
     };
+    let mut crash_font: Option<macroquad::text::Font> = load_crash_font().await;
 
-    let mut main = Some(Main::new(Box::new(MainScene::new(font.clone()).await?), TimeManager::default(), None).await?);
+    #[cfg(feature = "intest")]
+    intest::init().await;
+
+    // 应用当前主题：读取主题目录 config.json，将非空资源项注册为覆盖，
+    // 替换默认 assets 资源后，再进入启动场景加载。
+    crate::theme::apply_theme_overrides();
+
+    let mut main = Some(Main::new(Box::new(BootScene::new(font.clone()).await?), TimeManager::default(), None).await?);
+
+    #[cfg(target_os = "android")]
+    {
+        // 处理来自深链接（phira://）的多人启动参数
+        if let Some((join, create, server)) = STARTUP_ARGS.lock().unwrap().take() {
+            use crate::scene::MP_PANEL;
+            let join_room: Option<phira_mp_common::RoomId> = join.and_then(|s| s.try_into().ok());
+            let create_room: Option<phira_mp_common::RoomId> = create.and_then(|s| s.try_into().ok());
+            MP_PANEL.with(|it| {
+                if let Some(panel) = it.borrow_mut().as_mut() {
+                    panel.handle_startup_args(join_room, create_room, server);
+                }
+            });
+        }
+    }
 
     #[cfg(target_os = "windows")]
     {
@@ -292,10 +352,10 @@ async fn the_main() -> Result<()> {
         let mut join_room: Option<phira_mp_common::RoomId> = None;
         let mut create_room: Option<phira_mp_common::RoomId> = None;
         let mut mp_address: Option<String> = None;
-        
+
         for arg in std::env::args() {
             let arg = arg.trim();
-            
+
             // 处理多种格式的启动参数
             let processed_arg = if arg.starts_with("phira://") {
                 // 处理 URI 格式：phira://room/join/123&server=...
@@ -309,7 +369,7 @@ async fn the_main() -> Result<()> {
             } else {
                 continue;
             };
-            
+
             if processed_arg.starts_with("room/join/") {
                 let mut parts = processed_arg.split("&");
                 if let Some(room_part) = parts.next() {
@@ -346,7 +406,7 @@ async fn the_main() -> Result<()> {
                 }
             }
         }
-        
+
         // 处理启动参数
         if join_room.is_some() || create_room.is_some() {
             use crate::scene::MP_PANEL;
@@ -383,20 +443,38 @@ async fn the_main() -> Result<()> {
         last_frame_start = frame_start as f32;
 
         if crashed {
+            // 先恢复默认渲染状态，避免崩溃残留的 FBO/相机/视口把黑屏与崩溃界面渲染到离屏纹理（Android 白屏根因）
+            crash::reset_gl_state();
             let elapsed = get_time() - crash_start_time;
             if elapsed < 1.5 {
                 // 先黑屏 1.5 秒
                 clear_background(BLACK);
             } else {
                 // 再显示白色崩溃界面
-                crash::render_crash_screen(crash_logo, &mut crash_painter);
+                crash::render_crash_screen(crash_logo, crash_font);
             }
             next_frame().await;
             continue;
         }
 
+        // 处理深链接（phira://）启动参数，app 运行中也生效
+        #[cfg(target_os = "android")]
+        if let Some((join, create, server)) = STARTUP_ARGS.lock().unwrap().take() {
+            use crate::scene::MP_PANEL;
+            let join_room: Option<phira_mp_common::RoomId> = join.and_then(|s| s.try_into().ok());
+            let create_room: Option<phira_mp_common::RoomId> = create.and_then(|s| s.try_into().ok());
+            MP_PANEL.with(|it| {
+                if let Some(panel) = it.borrow_mut().as_mut() {
+                    panel.handle_startup_args(join_room, create_room, server);
+                }
+            });
+        }
+
         let frame_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
             let m = main.as_mut().unwrap();
+            // 每帧同步日志叠加层开关（log.rs 的 render_overlay 读取该原子量）
+            prpr::log::LOG_OVERLAY_ENABLED
+                .store(get_data().config.log_overlay, std::sync::atomic::Ordering::Relaxed);
             m.update()?;
             m.render(&mut painter)?;
             if let Ok(paused) = rx.try_recv() {
@@ -415,9 +493,24 @@ async fn the_main() -> Result<()> {
                 error!("uncaught error: {err:?}");
                 show_error(err);
             }
-            Err(_) => {
+            Err(payload) => {
                 crashed = true;
                 crash_start_time = get_time();
+                // 兜底：直接从 panic payload 提取崩溃详情写入 CRASH_INFO + crash.log，
+                // 避免 panic 钩子因故未填充时崩溃界面拿不到任何信息。
+                crash::capture_panic(payload);
+                crash_logo = load_texture("crashlogo.png").await.ok();
+                if crash_logo.is_none() {
+                    crash_logo = load_file("crashlogo.png").await.ok().map(|bytes| {
+                        let image = Image::from_file_with_format(&bytes, Some(ImageFormat::Png));
+                        Texture2D::from_image(&image)
+                    });
+                }
+                // 优先复用启动时已加载的崩溃字体（其图集在崩溃前已正常上传 GPU）。
+                // 仅当其为空时才重新加载，避免崩溃后 load_file 失败回退到可能失效的默认位图字体。
+                if crash_font.is_none() {
+                    crash_font = load_crash_font().await;
+                }
                 if let Some(m) = main.take() {
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         drop(m);
@@ -536,42 +629,77 @@ fn build_global_window_conf() -> Conf {
             .is_some_and(|d| d.config.fullscreen_mode);
     }
 
+    for arg in std::env::args().skip(1) {
+        if let Some(v) = arg.strip_prefix("--weight=") {
+            if let Ok(w) = v.parse::<i32>() {
+                conf.window_width = w;
+            }
+        } else if let Some(v) = arg.strip_prefix("--height=") {
+            if let Ok(h) = v.parse::<i32>() {
+                conf.window_height = h;
+            }
+        }
+    }
+
     conf
 }
 
 #[no_mangle]
 pub extern "C" fn quad_main() {
     crash::set_panic_hook();
+    // Render child-process mode: headless, reads job from stdin, writes progress to stdout.
+    #[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32", target_env = "ohos")))]
+    if std::env::args().nth(1).as_deref() == Some("render") {
+        // Initialize tokio runtime for spawn_blocking used by file system
+        // Use current-thread to avoid thread-local (PGR_FONT/BOLD_FONT) migration
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+
+        let mut conf = build_global_window_conf();
+        conf.headless = true;
+        // Never inherit fullscreen: the fullscreen branch in miniquad's window
+        // creation uses WS_VISIBLE, which would show the render window and steal
+        // focus from the game even in headless mode.
+        conf.fullscreen = false;
+        conf.window_width = 1920;
+        conf.window_height = 1080;
+        macroquad::Window::from_config(conf, async {
+            prpr::core::init_assets();
+            if let Err(err) = render_worker::run().await {
+                eprintln!("render worker error: {err:?}");
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        });
+        return;
+    }
     macroquad::Window::from_config(build_global_window_conf(), async {
         if let Err(err) = the_main().await {
             error!(?err, "global error");
             crash::set_error(&err.to_string());
 
             // 尝试加载崩溃界面资源
-            let crash_logo = match load_texture("crashlogo.png").await {
-                Ok(tex) => Some(tex),
-                Err(_) => None,
-            };
-
-            // 尝试加载字体创建 TextPainter
-            let mut crash_painter = match load_file("font.ttf").await {
-                Ok(bytes) => match FontArc::try_from_vec(bytes) {
-                    Ok(font) => Some(TextPainter::new(font, None)),
-                    Err(_) => None,
-                },
-                Err(_) => None,
-            };
+            let mut crash_logo = load_texture("crashlogo.png").await.ok();
+            if crash_logo.is_none() {
+                crash_logo = load_file("crashlogo.png").await.ok().map(|bytes| {
+                    let image = Image::from_file_with_format(&bytes, Some(ImageFormat::Png));
+                    Texture2D::from_image(&image)
+                });
+            }
+            let crash_font = load_crash_font().await;
 
             // 崩溃渲染循环：先黑屏再显示崩溃界面
             let crash_start_time = get_time();
             loop {
+                crash::reset_gl_state();
                 let elapsed = get_time() - crash_start_time;
                 if elapsed < 1.5 {
                     clear_background(BLACK);
-                } else if let Some(ref mut painter) = crash_painter {
-                    crash::render_crash_screen(crash_logo, painter);
                 } else {
-                    crash::render_crash_screen_fallback(crash_logo);
+                    crash::render_crash_screen(crash_logo, crash_font);
                 }
                 next_frame().await;
             }
@@ -619,14 +747,21 @@ pub extern "C" fn Java_quad_1native_QuadNative_prprActivityOnDestroy(_env: EnvUn
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "C" fn Java_quad_1native_QuadNative_setDataPath(_env: EnvUnowned, _class: JClass, path: JString) {
-    *DATA_PATH.lock().unwrap() = Some(path.to_string());
+pub extern "C" fn Java_quad_1native_QuadNative_setDataPath(mut env: EnvUnowned, _class: JClass, path: JString) {
+    let s = match env.with_env_no_catch(|env| path.try_to_string(env)).into_outcome() {
+        Outcome::Ok(s) => s,
+        _ => String::new(),
+    };
+    *DATA_PATH.lock().unwrap() = Some(s);
 }
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "C" fn Java_quad_1native_QuadNative_setTempDir(_env: EnvUnowned, _class: JClass, path: JString) {
-    let path = path.to_string();
+pub extern "C" fn Java_quad_1native_QuadNative_setTempDir(mut env: EnvUnowned, _class: JClass, path: JString) {
+    let path = match env.with_env_no_catch(|env| path.try_to_string(env)).into_outcome() {
+        Outcome::Ok(s) => s,
+        _ => String::new(),
+    };
     std::env::set_var("TMPDIR", path.clone());
     *CACHE_DIR.lock().unwrap() = Some(path);
 }
@@ -639,9 +774,13 @@ pub extern "C" fn Java_quad_1native_QuadNative_setDpi(_env: EnvUnowned, _class: 
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "C" fn Java_quad_1native_QuadNative_setChosenFile(_env: EnvUnowned, _class: JClass, file: JString) {
+pub extern "C" fn Java_quad_1native_QuadNative_setChosenFile(mut env: EnvUnowned, _class: JClass, file: JString) {
     use prpr::scene::CHOSEN_FILE;
-    CHOSEN_FILE.lock().unwrap().1 = Some(file.to_string());
+    let file = match env.with_env_no_catch(|env| file.try_to_string(env)).into_outcome() {
+        Outcome::Ok(s) => s,
+        _ => String::new(),
+    };
+    CHOSEN_FILE.lock().unwrap().1 = Some(file);
 }
 
 #[cfg(target_os = "android")]
@@ -662,9 +801,52 @@ pub extern "C" fn Java_quad_1native_QuadNative_markImportRespack(_env: EnvUnowne
 
 #[cfg(target_os = "android")]
 #[no_mangle]
-pub extern "C" fn Java_quad_1native_QuadNative_setInputText(_env: EnvUnowned, _class: JClass, text: JString) {
+pub extern "C" fn Java_quad_1native_QuadNative_markAutoImport(_env: EnvUnowned, _class: JClass) {
+    use prpr::scene::CHOSEN_FILE;
+
+    // 自动识别：zip 内含 click.png 视为资源包，否则视为谱面
+    CHOSEN_FILE.lock().unwrap().0 = Some("_import_auto".to_owned());
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_quad_1native_QuadNative_setInputText(mut env: EnvUnowned, _class: JClass, text: JString) {
     use prpr::scene::INPUT_TEXT;
-    INPUT_TEXT.lock().unwrap().1 = Some(text.to_string());
+    let text = match env.with_env_no_catch(|env| text.try_to_string(env)).into_outcome() {
+        Outcome::Ok(s) => s,
+        _ => String::new(),
+    };
+    INPUT_TEXT.lock().unwrap().1 = Some(text);
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_quad_1native_QuadNative_setStartupArgs(mut env: EnvUnowned, _class: JClass, join: JString, create: JString, server: JString) {
+    let join = if join.is_null() {
+        None
+    } else {
+        match env.with_env_no_catch(|e| join.try_to_string(e)).into_outcome() {
+            Outcome::Ok(v) => Some(v),
+            _ => None,
+        }
+    };
+    let create = if create.is_null() {
+        None
+    } else {
+        match env.with_env_no_catch(|e| create.try_to_string(e)).into_outcome() {
+            Outcome::Ok(v) => Some(v),
+            _ => None,
+        }
+    };
+    let server = if server.is_null() {
+        None
+    } else {
+        match env.with_env_no_catch(|e| server.try_to_string(e)).into_outcome() {
+            Outcome::Ok(v) => Some(v),
+            _ => None,
+        }
+    };
+    *STARTUP_ARGS.lock().unwrap() = Some((join, create, server));
 }
 
 #[cfg(not(all(target_os = "android", feature = "aa")))]
@@ -701,6 +883,38 @@ pub extern "C" fn Java_quad_1native_QuadNative_antiAddictionCallback(_env: EnvUn
     }
 }
 
+// === Android 输入法操作（全选/复制/剪切/粘贴） ===
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_quad_1native_QuadNative_inputSelectAll(_env: EnvUnowned, _class: JClass) {
+    prpr::scene::input_select_all();
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_quad_1native_QuadNative_inputBackspace(_env: EnvUnowned, _class: JClass) {
+    prpr::scene::input_backspace();
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_quad_1native_QuadNative_inputCopy(_env: EnvUnowned, _class: JClass) {
+    prpr::scene::input_copy();
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_quad_1native_QuadNative_inputCut(_env: EnvUnowned, _class: JClass) {
+    prpr::scene::input_cut();
+}
+
+#[cfg(target_os = "android")]
+#[no_mangle]
+pub extern "C" fn Java_quad_1native_QuadNative_inputPaste(_env: EnvUnowned, _class: JClass) {
+    prpr::scene::input_paste();
+}
+
 #[cfg(target_env = "ohos")]
 #[napi]
 pub fn set_input_text(text: String) {
@@ -720,4 +934,12 @@ pub fn set_chosen_file(file: String) {
 pub fn mark_auto_import() {
     use prpr::scene::CHOSEN_FILE;
     CHOSEN_FILE.lock().unwrap().0 = Some("_import_auto".to_owned());
+}
+
+#[cfg(target_env = "ohos")]
+#[napi]
+pub fn input_cancelled() {
+    use prpr::scene::{INPUT_CANCELLED, INPUT_TEXT};
+    let id = INPUT_TEXT.lock().unwrap().0.clone().unwrap_or_default();
+    *INPUT_CANCELLED.lock().unwrap() = Some(id);
 }

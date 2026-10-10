@@ -11,19 +11,24 @@ use super::{
 use crate::{
     bin::BinaryReader,
     config::{Config, Mods},
-    core::{copy_fbo, BadNote, Chart, ChartExtra, Effect, Point, Resource, UIElement, Vector, PGR_FONT},
+    core::{copy_fbo, BadNote, BOLD_FONT, Chart, ChartExtra, DynamicBackground, Effect, Point, Resource, UIElement, Vector, PGR_FONT},
     ext::{get_viewport, parse_time, screen_aspect, semi_white, RectExt, SafeTexture, ScaleType},
     fs::FileSystem,
+    gamepad::GamepadFrame,
     info::{ChartFormat, ChartInfo},
-    judge::Judge,
+    judge::{Judge, Judgement},
     parse::{parse, parse_extra, parse_pec, parse_phigros, parse_rpe, LyricLine, LyricRole, LyricWord},
     task::Task,
     time::TimeManager,
-    ui::{RectButton, TextPainter, Ui},
+    ui::{RectButton, TextPainter, Ui, PREFER_ALT_UI},
 };
+
+#[cfg(target_os = "windows")]
+use crate::smtc::{SmtcCommand, SmtcSession};
 use anyhow::{bail, Context, Result};
 use concat_string::concat_string;
 use inputbox::InputBox;
+use std::sync::atomic::Ordering;
 use lyon::path::Path;
 use macroquad::{prelude::*, window::InternalGlContext};
 use sasa::{Music, MusicParams};
@@ -42,11 +47,36 @@ use std::{
 };
 use tracing::{debug, warn};
 
+// 最近一次游戏结束的真实成绩（供联机面板上报，不依赖在线 record id）
+#[derive(Clone, Copy, Default)]
+pub struct MpResult {
+    pub score: u32,
+    pub accuracy: f32,
+    pub full_combo: bool,
+    pub max_combo: u32,
+    pub perfect: u32,
+    pub good: u32,
+    pub bad: u32,
+    pub miss: u32,
+}
+
+static MP_RESULT: std::sync::LazyLock<Mutex<Option<MpResult>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
+pub fn mp_reset_result() {
+    *MP_RESULT.lock().unwrap() = None;
+}
+
+pub fn mp_take_result() -> Option<MpResult> {
+    MP_RESULT.lock().unwrap().take()
+}
+
 const PAUSE_CLICK_INTERVAL: f32 = 0.7;
 
 #[cfg(target_os = "windows")]
 mod windows_ime {
     use std::os::raw::c_void;
+    use std::sync::Mutex;
 
     #[link(name = "user32")]
     extern "system" {
@@ -60,11 +90,18 @@ mod windows_ime {
         fn ImmReleaseContext(hwnd: *mut c_void, himc: *mut c_void) -> i32;
     }
 
+    struct Himc(*mut c_void);
+    unsafe impl Send for Himc {}
+
+    // 保存 disable 前的 IME 上下文，enable 时恢复
+    static SAVED_HIMC: Mutex<Option<Himc>> = Mutex::new(None);
+
     pub fn disable() {
         unsafe {
             let hwnd = GetForegroundWindow();
             if !hwnd.is_null() {
-                ImmAssociateContext(hwnd, std::ptr::null_mut());
+                let old = ImmAssociateContext(hwnd, std::ptr::null_mut());
+                *SAVED_HIMC.lock().unwrap() = Some(Himc(old));
             }
         }
     }
@@ -73,10 +110,17 @@ mod windows_ime {
         unsafe {
             let hwnd = GetForegroundWindow();
             if !hwnd.is_null() {
-                let himc = ImmGetContext(hwnd);
+                let saved = SAVED_HIMC.lock().unwrap().take();
+                let himc = if let Some(Himc(h)) = saved { h } else { std::ptr::null_mut() };
                 if !himc.is_null() {
                     ImmAssociateContext(hwnd, himc);
-                    ImmReleaseContext(hwnd, himc);
+                } else {
+                    // 没有保存的上下文，尝试获取默认上下文
+                    let himc = ImmGetContext(hwnd);
+                    if !himc.is_null() {
+                        ImmAssociateContext(hwnd, himc);
+                        ImmReleaseContext(hwnd, himc);
+                    }
                 }
             }
         }
@@ -170,11 +214,13 @@ pub struct GameScene {
     pub res: Resource,
     pub chart: Chart,
     pub judge: Judge,
+    pub xcsim: bool,
     pub gl: InternalGlContext<'static>,
     player: Option<BasicPlayer>,
     chart_bytes: Vec<u8>,
     chart_format: ChartFormat,
     info_offset: f32,
+    replay_record_local_path: Option<String>,
     effects: Vec<Effect>,
 
     first_in: bool,
@@ -194,6 +240,7 @@ pub struct GameScene {
     upload_fn: Option<UploadFn>,
     update_fn: Option<UpdateFn>,
     save_fn: Option<SaveFn>,
+    record_save_fn: Option<crate::replay::RecordSaveFn>,
 
     best_record: Option<SimpleRecord>,
 
@@ -203,6 +250,7 @@ pub struct GameScene {
     fps_last_frame_time: f64,
 
     dead: bool,
+    game_paused: bool,
 
     // skip bar
     skip_bar_active: bool,
@@ -217,15 +265,24 @@ pub struct GameScene {
     skip_wait_timer: f32,
     skip_fade_out_progress: f32,
     skip_alt_must_release: bool,
+    skip_gp_combo_must_release: bool,
     skip_instant: bool,
     corner_skip_touch_ids: [Option<u64>; 4],
     track_skipped: bool,
+    // health bar
+    health: f32,
+    last_judge_counts: [u32; 4],
 
     // lyrics
     lyrics: Vec<LyricLine>,
     active_lyrics: Vec<LyricDisplay>,
     lyric_index: usize,
     text_height: f32,
+
+    #[cfg(target_os = "windows")]
+    smtc: Option<SmtcSession>,
+    #[cfg(target_os = "windows")]
+    smtc_last_timeline: f64,
 }
 
 macro_rules! reset {
@@ -246,6 +303,8 @@ macro_rules! reset {
         $self.dead = false;
         $self.active_lyrics.clear();
         $self.lyric_index = 0;
+        $self.health = 100.0;
+        $self.last_judge_counts = [0; 4];
     }};
 }
 
@@ -331,10 +390,20 @@ impl GameScene {
         player: Option<BasicPlayer>,
         background: SafeTexture,
         illustration: SafeTexture,
+        mut dynamic_bg: Option<DynamicBackground>,
         upload_fn: Option<UploadFn>,
         update_fn: Option<UpdateFn>,
         save_fn: Option<SaveFn>,
+        xcsim: bool,
+        record_save_fn: Option<crate::replay::RecordSaveFn>,
+        replay_handoff: Option<crate::replay::ReplayHandoff>,
     ) -> Result<Self> {
+        let pending_playback = crate::replay::take_pending_playback();
+        let pending_record = crate::replay::take_pending_record();
+        let replay_handoff = replay_handoff
+            .or_else(|| pending_playback.map(crate::replay::ReplayHandoff::Playback))
+            .or_else(|| pending_record.map(|chart_local_path| crate::replay::ReplayHandoff::Record { chart_local_path }));
+
         match mode {
             GameMode::TweakOffset => {
                 config.mods.insert(Mods::AUTOPLAY);
@@ -370,6 +439,23 @@ impl GameScene {
         }
 
         let info_offset = info.offset;
+
+        // SMTC 所需的元数据：在把 config/info move 进 Resource 之前先存下来
+        #[cfg(target_os = "windows")]
+        let smtc_enabled = config.smtc_integration;
+        #[cfg(target_os = "windows")]
+        let smtc_title = info.name.clone();
+        #[cfg(target_os = "windows")]
+        let smtc_artist = info.composer.clone();
+
+        // SMTC 封面字节：在把 fs move 进 Resource 之前，先把曲绘读出来
+        #[cfg(target_os = "windows")]
+        let smtc_cover: Vec<u8> = if smtc_enabled {
+            fs.load_file(&info.illustration).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         let mut res = Resource::new(
             config,
             info,
@@ -377,6 +463,7 @@ impl GameScene {
             player.as_ref().and_then(|it| it.avatar.clone()),
             background,
             illustration,
+            dynamic_bg,
             chart.extra.effects.is_empty() && effects.is_empty(),
         )
         .await
@@ -391,12 +478,13 @@ impl GameScene {
 
         let exercise_range = (chart.offset + info_offset + res.config.offset) as f64..res.track_length;
 
-        let judge = Judge::new(&chart);
+        let judge = Judge::new_xcsim(&chart, xcsim);
 
         let music = Self::new_music(&mut res)?;
         let lyrics = std::mem::take(&mut chart.extra.lyrics);
+        let normal_mode = matches!(mode, GameMode::Normal);
 
-        Ok(Self {
+        let mut this = Self {
             should_exit: false,
             next_scene: None,
 
@@ -404,12 +492,14 @@ impl GameScene {
             res,
             chart,
             judge,
+            xcsim,
             gl: unsafe { get_internal_gl() },
             player,
             chart_bytes,
             chart_format,
             effects,
             info_offset,
+            replay_record_local_path: None,
 
             first_in: false,
             exercise_range,
@@ -428,6 +518,7 @@ impl GameScene {
             upload_fn,
             update_fn,
             save_fn,
+            record_save_fn,
 
             best_record: None,
 
@@ -438,6 +529,7 @@ impl GameScene {
             fps_last_frame_time: 0.0,
 
             dead: false,
+            game_paused: false,
 
             skip_bar_active: false,
             skip_bar_retracting: false,
@@ -451,15 +543,55 @@ impl GameScene {
             skip_wait_timer: 0.0,
             skip_fade_out_progress: 0.0,
             skip_alt_must_release: false,
+            skip_gp_combo_must_release: false,
             skip_instant: false,
             corner_skip_touch_ids: [None; 4],
             track_skipped: false,
+            health: 100.0,
+            last_judge_counts: [0; 4],
 
             lyrics,
             active_lyrics: Vec::new(),
             lyric_index: 0,
             text_height: 0.0,
-        })
+
+            #[cfg(target_os = "windows")]
+            smtc: if smtc_enabled {
+                match SmtcSession::new(&smtc_title, &smtc_artist, &smtc_cover, false) {
+                    Ok(s) => {
+                        tracing::info!("SMTC session started: {}", smtc_title);
+                        Some(s)
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to start SMTC session: {e:?}");
+                        None
+                    }
+                }
+            } else {
+                None
+            },
+            #[cfg(target_os = "windows")]
+            smtc_last_timeline: -1000.0,
+        };
+
+        // Pick up any pending replay/record configuration queued by
+        // the caller before returning.
+        if let Some(replay_handoff) = replay_handoff {
+            match replay_handoff {
+                crate::replay::ReplayHandoff::Playback(replay) => {
+                    this.judge.set_replay_data(replay);
+                }
+                crate::replay::ReplayHandoff::Record { chart_local_path } => {
+                    // Record only when it actually makes sense to: a normal
+                    // play with no autoplay and 1x speed.
+                    if normal_mode && !this.res.config.autoplay() && (this.res.config.speed - 1.0).abs() < 1e-3 {
+                        this.replay_record_local_path = Some(chart_local_path);
+                        this.start_replay_recording();
+                    }
+                }
+            }
+        }
+        Ok(this)
     }
 
     fn new_music(res: &mut Resource) -> Result<Music> {
@@ -499,6 +631,17 @@ impl GameScene {
         let record = if self.track_skipped || self.res.config.mods.intersects(Mods::UNRATED) || self.res.config.speed < 1.0 - 1e-3 {
             None
         } else {
+            // 记录真实成绩，供联机面板在游戏结束后上报
+            *MP_RESULT.lock().unwrap() = Some(MpResult {
+                score: result.score,
+                accuracy: result.accuracy as f32,
+                full_combo: result.max_combo == result.num_of_notes,
+                max_combo: result.max_combo,
+                perfect: result.counts[0],
+                good: result.counts[1],
+                bad: result.counts[2],
+                miss: result.counts[3],
+            });
             Some(SimpleRecord {
                 score: result.score as _,
                 accuracy: result.accuracy as _,
@@ -618,6 +761,25 @@ impl GameScene {
 
             let margin = 0.03;
 
+            // Health bar mod (top-left, aligned with pause button height)
+            if res.config.mods.contains(Mods::HEALTH_BAR) {
+                let hb_h = pause_h;
+                let hb_y = pause_center.y - pause_h / 2.;
+                let hb_bar_x = -0.78;
+                let hb_bar_w = 0.32;
+                let hp_ratio = (self.health / 100.0).clamp(0.0, 1.0);
+                // HP number on the left of the bar
+                ui.text(format!("{}", self.health.round() as i32))
+                    .pos(hb_bar_x - 0.02, hb_y + hb_h / 2.)
+                    .anchor(1., 0.5)
+                    .size(0.4)
+                    .color(Color::new(1., 1., 1., 0.9))
+                    .draw_using(&BOLD_FONT);
+                // Bar background + foreground
+                ui.fill_rect(Rect::new(hb_bar_x, hb_y, hb_bar_w, hb_h), Color::new(0., 0., 0., 0.5));
+                ui.fill_rect(Rect::new(hb_bar_x, hb_y, hb_bar_w * hp_ratio, hb_h), Color::new(1., 1., 1., 0.9));
+            }
+
             let legacy_aui = !res.info.use_attach_ui_fix.unwrap_or_default();
             let unit_h = if legacy_aui { ui.text("0").measure_using(&PGR_FONT).h } else { 0. };
 
@@ -625,7 +787,12 @@ impl GameScene {
             let h = 0.07;
             let score_top = top + eps * 2.2 - (1. - p) * 0.4 + ui_shift_y;
             let score_right = 1. - margin;
-            let score = format!("{:07}", self.judge.score());
+            // XC-SIM 分数固定显示 8 位，官方/本地谱面显示 7 位。
+            let score = if self.xcsim {
+                format!("{:08}", self.judge.score())
+            } else {
+                format!("{:07}", self.judge.score())
+            };
             let scale_point = legacy_aui.then(|| {
                 let ct = ui.text(&score).size(0.8).measure_using(&PGR_FONT).center();
                 (score_right - ct.x, score_top + ct.y)
@@ -708,6 +875,41 @@ impl GameScene {
                             .draw_using(&PGR_FONT);
                     });
                 }
+            }
+            // Early/Late 指示（显示在屏幕顶部下方 150px）。
+            // 原版/本地：Perfect 不显示，Good/Bad 显示；XC-SIM：Perfect+(≤50ms) 不显示，Perfect/Good/Bad 显示。
+            // 每个指示独立瞬间显示，然后在 1 秒内渐隐（密集 Note 也不会互相重置）。
+            self.judge.early_late_list.retain(|&(_, _, tj)| res.time - tj <= 1.0);
+            let base_y = top + (300.0 / res.aspect_ratio) / screen_height() + ui_shift_y;
+            let mut shown = 0;
+            for &(j, diff, tj) in &self.judge.early_late_list {
+                let age = res.time - tj;
+                if age > 1.0 {
+                    continue;
+                }
+                let early = match j {
+                    Judgement::Good | Judgement::Bad => Some(diff < 0.),
+                    Judgement::Perfect => {
+                        if self.xcsim && diff.abs() > 0.05 {
+                            Some(diff < 0.)
+                        } else {
+                            None
+                        }
+                    }
+                    Judgement::Miss => None,
+                };
+                let Some(early) = early else { continue };
+                let alpha = (1. - age).clamp(0., 1.) as f32;
+                let (text, color) = if early {
+                    ("Early", Color::new(1., 0.2, 0.2, alpha))
+                } else {
+                    ("Late", Color::new(0.2, 0.4, 1., alpha))
+                };
+                let y = base_y + shown as f32 * 0.06;
+                self.chart.with_element(ui, res, UIElement::Combo, None, (0., y), |ui, _c| {
+                    ui.text(text).pos(0., y).anchor(0.5, 0.5).size(0.45).color(color).draw_using(&PGR_FONT);
+                });
+                shown += 1;
             }
             // magic to make score visible, refer to phira/src/rate.rs#L219
             ui.text("").draw_using(&PGR_FONT);
@@ -802,7 +1004,8 @@ impl GameScene {
 
             if !matches!(line.role, LyricRole::Background) {
                 for active in &self.active_lyrics {
-                    if active.line.end_time > line.start_time {
+                    // 只在同 role 之间垂直堆叠，Main(左) 与 Duet(右) 应并排显示
+                    if active.line.role == line.role && active.line.end_time > line.start_time {
                         y_offset += self.text_height * 1.5;
                     }
                 }
@@ -855,7 +1058,7 @@ impl GameScene {
         for lyric in &self.active_lyrics {
             let appear_progress = ((time - lyric.appear_start) / FADE_IN_TIME).clamp(0.0, 1.0);
             let disappear_progress = ((time - lyric.disappear_start) / FADE_OUT_TIME).clamp(0.0, 1.0);
-            
+
             let alpha = (1.0 - disappear_progress) * appear_progress;
             if alpha <= 0.0 {
                 continue;
@@ -870,12 +1073,8 @@ impl GameScene {
             };
 
             let base_y = match role {
-                LyricRole::Background => {
-                    lyrics_center_y + self.text_height * 1.8
-                }
-                _ => {
-                    lyrics_center_y
-                }
+                LyricRole::Background => lyrics_center_y + self.text_height * 1.8,
+                _ => lyrics_center_y,
             } + lyric.y_offset;
 
             let alpha_value = match role {
@@ -891,7 +1090,7 @@ impl GameScene {
             let mut current_x = 0.0;
             for (i, word) in lyric.line.words.iter().enumerate() {
                 let word_width = ui.text(&word.text).size(size).measure().w;
-                
+
                 if time < word.start_time {
                     current_x += word_width;
                     continue;
@@ -905,9 +1104,11 @@ impl GameScene {
                 let color = Color::new(1., 1., 1., word_alpha as f32);
 
                 let draw_x = if anchor_x == 0.0 {
+                    // 左对齐：pos 即单词左边缘，anchor=0
                     x_pos as f32 + current_x
                 } else {
-                    x_pos as f32 - total_width + current_x
+                    // 右对齐：pos 即单词右边缘，anchor=1；需加上当前词宽
+                    x_pos as f32 - total_width + current_x + word_width
                 };
 
                 let draw_y = base_y - word_float_offset;
@@ -925,38 +1126,85 @@ impl GameScene {
     }
 
     fn overlay_ui(&mut self, ui: &mut Ui, tm: &mut TimeManager) -> Result<()> {
+        let is_replay = self.judge.is_replaying();
         let c = semi_white(self.res.alpha);
         let res = &mut self.res;
         if tm.paused() && !self.skip_done {
             let h = 1. / res.aspect_ratio;
             draw_rectangle(-1., -h, 2., h * 2., Color::new(0., 0., 0., 0.6));
-            let o = if self.mode == GameMode::Exercise { -0.3 } else { 0. };
+            let o = if self.mode == GameMode::Exercise || is_replay { -0.3 } else { 0. };
             let s = 0.06;
             let w = 0.05;
             let no_retry = self.mode == GameMode::NoRetry;
-            draw_texture_ex(
-                *res.icon_back,
-                -s * 3. - w,
-                -s + o,
-                c,
-                DrawTextureParams {
-                    dest_size: Some(vec2(s * 2., s * 2.)),
-                    ..Default::default()
-                },
-            );
-            let r = Rect::new(0., o, 0., 0.).feather(s);
             let disabled_color = semi_white(res.alpha * 0.4);
-            ui.fill_rect(r, (*res.icon_retry, r.feather(0.02), ScaleType::Fit, if no_retry { disabled_color } else { c }));
-            draw_texture_ex(
-                *res.icon_resume,
-                s + w,
-                -s + o,
-                if self.dead { disabled_color } else { c },
-                DrawTextureParams {
-                    dest_size: Some(vec2(s * 2., s * 2.)),
-                    ..Default::default()
-                },
-            );
+            let xchs = PREFER_ALT_UI.load(Ordering::Relaxed);
+            // XCHS 暂停卡片（居中圆角卡 + 三行按钮），与 xcsim game_scene.rs 一致
+            let xchs_card = Rect::new(-0.34, o - 0.28, 0.68, 0.56);
+            let xchs_row = |row: i32| {
+                let btn_h = 0.105;
+                let gap = 0.022;
+                Rect::new(xchs_card.x + 0.05, xchs_card.y + 0.16 + row as f32 * (btn_h + gap), xchs_card.w - 0.10, btn_h)
+            };
+            if xchs {
+                let a = res.alpha;
+                let pink = Color::new(1.0, 0.58, 0.706, a);
+                let cream = Color::new(0.984, 0.973, 0.886, a);
+                ui.fill_path(&xchs_card.feather(0.016).rounded(0.07), Color::new(0.949, 0.412, 0.580, 0.40 * a));
+                ui.fill_path(&xchs_card.rounded(0.06), Color::new(0.165, 0.110, 0.180, 0.98 * a));
+                ui.text("PAUSED")
+                    .pos(0., xchs_card.y + 0.072)
+                    .anchor(0.5, 0.5)
+                    .no_baseline()
+                    .size(0.92)
+                    .color(cream)
+                    .draw();
+                ui.fill_path(&Rect::new(-0.06, xchs_card.y + 0.118, 0.12, 0.006).rounded(0.003), pink);
+                let pill = |ui: &mut Ui, br: Rect, tex: &SafeTexture, label: &str, primary: bool, enabled: bool| {
+                    let ea = if enabled { 1.0 } else { 0.4 };
+                    if primary && enabled {
+                        ui.fill_path(&br.rounded(0.05), Color::new(0.949, 0.412, 0.580, a));
+                    } else {
+                        ui.fill_path(&br.rounded(0.05), Color::new(0.243, 0.165, 0.255, 0.96 * a * ea));
+                    }
+                    let isz = br.h * 0.56;
+                    let ir = Rect::new(br.x + 0.045, br.center().y - isz * 0.5, isz, isz);
+                    let icon_c = if primary && enabled { cream } else { Color::new(pink.r, pink.g, pink.b, pink.a * ea) };
+                    ui.fill_rect(ir, (**tex, ir, ScaleType::Fit, icon_c));
+                    ui.text(label)
+                        .pos(ir.right() + 0.035, br.center().y)
+                        .anchor(0., 0.5)
+                        .no_baseline()
+                        .size(0.56)
+                        .color(Color::new(cream.r, cream.g, cream.b, cream.a * ea))
+                        .draw();
+                };
+                pill(ui, xchs_row(0), &res.icon_resume, "Resume", true, !self.dead);
+                pill(ui, xchs_row(1), &res.icon_retry, "Retry", false, !no_retry);
+                pill(ui, xchs_row(2), &res.icon_back, "Exit", false, true);
+            } else {
+                draw_texture_ex(
+                    *res.icon_back,
+                    -s * 3. - w,
+                    -s + o,
+                    c,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(s * 2., s * 2.)),
+                        ..Default::default()
+                    },
+                );
+                let r = Rect::new(0., o, 0., 0.).feather(s);
+                ui.fill_rect(r, (*res.icon_retry, r.feather(0.02), ScaleType::Fit, if no_retry { disabled_color } else { c }));
+                draw_texture_ex(
+                    *res.icon_resume,
+                    s + w,
+                    -s + o,
+                    if self.dead { disabled_color } else { c },
+                    DrawTextureParams {
+                        dest_size: Some(vec2(s * 2., s * 2.)),
+                        ..Default::default()
+                    },
+                );
+            }
             if res.config.interactive {
                 let mut clicked = None;
                 for touch in Judge::get_touches() {
@@ -964,6 +1212,16 @@ impl GameScene {
                         continue;
                     }
                     let p = touch.position;
+                    if xchs {
+                        if xchs_row(0).contains(p) {
+                            clicked = Some(1);
+                        } else if xchs_row(1).contains(p) {
+                            clicked = Some(0);
+                        } else if xchs_row(2).contains(p) {
+                            clicked = Some(-1);
+                        }
+                        continue;
+                    }
                     let p = Point::new(p.x, p.y);
                     for i in -1..=1 {
                         let ct = Point::new((s * 2. + w) * i as f32, o);
@@ -978,7 +1236,7 @@ impl GameScene {
                     clicked = None;
                 }
                 let mut pos = self.music.position();
-                if self.mode == GameMode::Exercise {
+                if self.mode == GameMode::Exercise || is_replay {
                     pos = tm.now();
                 }
                 if clicked.is_some_and(|it| it != -1) && (tm.speed - res.config.speed as f64).abs() > 0.01 {
@@ -999,7 +1257,9 @@ impl GameScene {
                         miniquad::native::set_interceptor_state(false);
                     }
                     Some(0) => {
+                        self.judge.discard_replay_record();
                         reset!(self, res, tm);
+                        Self::start_replay_recording_with(&mut self.judge, res, self.replay_record_local_path.clone());
                         if self.mode == GameMode::Exercise {
                             self.judge.advance_to(&mut self.chart, self.exercise_range.start);
                         }
@@ -1144,6 +1404,60 @@ impl GameScene {
                 for touch in ui.ensure_touches() {
                     touch.position /= asp;
                 }
+            } else if is_replay {
+                let asp = self.touch_scale();
+                for touch in ui.ensure_touches() {
+                    touch.position *= asp;
+                }
+                ui.dy(0.06);
+                let hw = 0.7;
+                let h = 0.06;
+                let rad = 0.03;
+                let track_length = self.res.track_length.max(1e-3);
+                let t = self.res.time.clamp(0., track_length);
+                let cur = -hw + (t / track_length) as f32 * hw * 2.;
+                ui.fill_rect(Rect::new(-hw, -h, hw * 2., h * 2.), GRAY);
+                ui.fill_rect(Rect::new(-hw, -h, cur + hw, h * 2.), WHITE);
+                ui.fill_rect(Rect::new(cur, -h, 0., h * 2.).feather(0.005), GREEN);
+                ui.fill_circle(cur, 0., rad, GREEN);
+                if self.exercise_press.is_none() {
+                    let r = ui.rect_to_global(Rect::new(-hw, -h, hw * 2., h * 2.).feather(rad));
+                    self.exercise_press = Judge::get_touches()
+                        .iter()
+                        .find(|it| it.phase == TouchPhase::Started && r.contains(it.position))
+                        .map(|it| (0, it.id));
+                }
+                ui.text(format!("{} / {}", fmt_time(t as f32), fmt_time(track_length as f32)))
+                    .pos(0., -0.23)
+                    .anchor(0.5, 0.)
+                    .size(0.8)
+                    .draw();
+                if let Some((_, id)) = self.exercise_press {
+                    let mut release_press = false;
+                    if let Some(touch) = Judge::get_touches().into_iter().rfind(|it| it.id == id) {
+                        let x = touch.position.x;
+                        let p = ((x + hw) as f64 / (hw * 2.) as f64 * track_length).clamp(0., track_length);
+                        let timeline_pos = p + self.offset() as f64;
+                        tm.seek_to(timeline_pos);
+                        self.music.seek_to(timeline_pos.max(0.))?;
+                        self.res.time = p;
+                        self.bad_notes.clear();
+                        self.chart.reset();
+                        self.judge.seek_replay_to(&mut self.chart, p);
+                        self.res.judge_line_color = self.res.res_pack.info.color_perfect();
+                        if matches!(touch.phase, TouchPhase::Cancelled | TouchPhase::Ended) {
+                            release_press = true;
+                        }
+                    } else {
+                        release_press = true;
+                    }
+                    if release_press {
+                        self.exercise_press = None;
+                    }
+                }
+                for touch in ui.ensure_touches() {
+                    touch.position /= asp;
+                }
             }
         }
         if let Some(time) = self.pause_rewind {
@@ -1175,6 +1489,44 @@ impl GameScene {
 
     fn offset(&self) -> f32 {
         self.chart.offset + self.res.config.offset + self.info_offset
+    }
+
+    fn start_replay_recording_with(judge: &mut Judge, res: &Resource, chart_local_path: Option<String>) {
+        let Some(chart_local_path) = chart_local_path else {
+            return;
+        };
+        if judge.is_replaying() {
+            return;
+        }
+        judge.start_recording(res.info.id, res.info.name.clone(), chart_local_path, res.info.level.clone(), res.info.offset, res.config.speed);
+    }
+
+    fn start_replay_recording(&mut self) {
+        Self::start_replay_recording_with(&mut self.judge, &self.res, self.replay_record_local_path.clone());
+    }
+
+    fn save_replay_recording_with(judge: &mut Judge, record_save_fn: &Option<crate::replay::RecordSaveFn>) {
+        if judge.is_replaying() {
+            return;
+        }
+        let Some(mut rec) = judge.take_replay_record() else {
+            return;
+        };
+        if rec.records.is_empty() {
+            return;
+        }
+
+        let result = judge.result();
+        rec.finalize(result.score as _, result.accuracy as _, result.max_combo as _, result.max_combo == result.num_of_notes);
+        if let Some(f) = record_save_fn {
+            if let Err(e) = f(rec) {
+                tracing::warn!("failed to save replay: {e:?}");
+            }
+        }
+    }
+
+    fn save_replay_recording(&mut self) {
+        Self::save_replay_recording_with(&mut self.judge, &self.record_save_fn);
     }
 
     fn tweak_offset(&mut self, ui: &mut Ui, ita: bool) {
@@ -1277,9 +1629,13 @@ impl Scene for GameScene {
         self.skip_wait_timer = 0.0;
         self.skip_fade_out_progress = 0.0;
         self.skip_alt_must_release = is_key_down(KeyCode::LeftAlt);
+        self.skip_gp_combo_must_release = false;
         self.skip_instant = false;
         self.corner_skip_touch_ids = [None; 4];
         self.track_skipped = false;
+        if self.replay_record_local_path.is_some() && !self.judge.is_recording_replay() {
+            self.start_replay_recording();
+        }
         Ok(())
     }
 
@@ -1288,9 +1644,17 @@ impl Scene for GameScene {
             self.pause_rewind = None;
             self.music.pause()?;
             tm.pause();
+            self.game_paused = true;
+            #[cfg(target_os = "windows")]
+            if let Some(s) = &self.smtc {
+                let _ = s.set_paused(true);
+                let _ = s.update_timeline(0.0, self.res.track_length, self.music.position());
+            }
         }
         #[cfg(target_env = "ohos")]
         miniquad::native::set_interceptor_state(false);
+        #[cfg(target_os = "windows")]
+        windows_ime::enable();
         Ok(())
     }
 
@@ -1298,13 +1662,77 @@ impl Scene for GameScene {
         if !matches!(self.state, State::Playing) {
             tm.resume();
         }
+        self.game_paused = false;
+        #[cfg(target_os = "windows")]
+        if let Some(s) = &self.smtc {
+            let _ = s.set_paused(false);
+            let _ = s.update_timeline(0.0, self.res.track_length, self.music.position());
+        }
+        #[cfg(target_os = "windows")]
+        windows_ime::disable();
         Ok(())
     }
 
     fn update(&mut self, tm: &mut TimeManager) -> Result<()> {
+        // 处理来自 SMTC 的按钮命令（Windows 独占）：先收集，释放借用后再执行
+        #[cfg(target_os = "windows")]
+        {
+            let mut cmds: Vec<SmtcCommand> = Vec::new();
+            if let Some(s) = &self.smtc {
+                while let Some(c) = s.try_recv() {
+                    cmds.push(c);
+                }
+            }
+            for cmd in cmds {
+                match cmd {
+                    SmtcCommand::Play => {
+                        if tm.paused() {
+                            self.music.play()?;
+                            tm.resume();
+                            self.game_paused = false;
+                            if let Some(s) = &self.smtc {
+                                let _ = s.set_paused(false);
+                            }
+                        }
+                    }
+                    SmtcCommand::Pause => {
+                        if !tm.paused() {
+                            self.pause(tm)?;
+                        }
+                    }
+                    SmtcCommand::Next => {
+                        if !self.skip_done && !self.track_skipped {
+                            self.skip_done = true;
+                            self.track_skipped = true;
+                            crate::ui::track_skip_sfx();
+                            self.skip_bar_active = false;
+                            self.skip_bar_retracting = false;
+                            self.skip_bar_from_corners = false;
+                            self.skip_transition_progress = 0.0;
+                            self.skip_wait_timer = 0.0;
+                            self.skip_fade_out_progress = 0.0;
+                            self.skip_instant = true;
+                        }
+                    }
+                    SmtcCommand::Previous => {
+                        self.should_exit = true;
+                    }
+                }
+            }
+        }
         self.res.audio.recover_if_needed()?;
         if matches!(self.state, State::Playing) {
             tm.update(self.music.position());
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(s) = &self.smtc {
+            let now = tm.real_time();
+            if now - self.smtc_last_timeline > 0.25 {
+                self.smtc_last_timeline = now;
+                let end = self.res.track_length;
+                let pos = self.music.position();
+                let _ = s.update_timeline(0.0, end, pos);
+            }
         }
         if self.mode == GameMode::Exercise && tm.now() > self.exercise_range.end && !tm.paused() {
             let state = self.state.clone();
@@ -1377,6 +1805,11 @@ impl Scene for GameScene {
             State::Ending => {
                 let t = time - self.res.track_length - WAIT_TIME;
                 if t >= AFTER_TIME + 0.3 {
+                    let is_replay = self.judge.is_replaying();
+
+                    // Persist any recorded replay before the scene tears down.
+                    self.save_replay_recording();
+
                     let mut record_data = None;
                     // TODO strengthen the protection
                     #[cfg(closed)]
@@ -1399,6 +1832,17 @@ impl Scene for GameScene {
                     let record = if self.track_skipped || self.res.config.mods.intersects(Mods::UNRATED) || self.res.config.speed < 1.0 - 1e-3 {
                         None
                     } else {
+                        // 记录真实成绩，供联机面板在游戏结束后上报
+                        *MP_RESULT.lock().unwrap() = Some(MpResult {
+                            score: result.score,
+                            accuracy: result.accuracy as f32,
+                            full_combo: result.max_combo == result.num_of_notes,
+                            max_combo: result.max_combo,
+                            perfect: result.counts[0],
+                            good: result.counts[1],
+                            bad: result.counts[2],
+                            miss: result.counts[3],
+                        });
                         Some(SimpleRecord {
                             score: result.score as _,
                             accuracy: result.accuracy as _,
@@ -1408,18 +1852,21 @@ impl Scene for GameScene {
                     self.next_scene = match self.mode {
                         GameMode::Normal | GameMode::NoRetry | GameMode::View => {
                             let historic_best = self.player.as_ref().map_or(0, |it| it.historic_best);
-                            if let Some(new_rec) = &record {
-                                if let Some(f) = &self.save_fn {
-                                    f(new_rec.clone())?;
-                                }
-                                if let Some(best) = &mut self.best_record {
-                                    best.update(new_rec);
-                                } else {
-                                    self.best_record = record.clone();
-                                }
-                                if let Some(best) = &self.best_record {
-                                    if let Some(player) = &mut self.player {
-                                        player.historic_best = player.historic_best.max(best.score as _);
+                            // Don't update local best / upload during replay playback.
+                            if !is_replay {
+                                if let Some(new_rec) = &record {
+                                    if let Some(f) = &self.save_fn {
+                                        f(new_rec.clone())?;
+                                    }
+                                    if let Some(best) = &mut self.best_record {
+                                        best.update(new_rec);
+                                    } else {
+                                        self.best_record = record.clone();
+                                    }
+                                    if let Some(best) = &self.best_record {
+                                        if let Some(player) = &mut self.player {
+                                            player.historic_best = player.historic_best.max(best.score as _);
+                                        }
                                     }
                                 }
                             }
@@ -1435,11 +1882,11 @@ impl Scene for GameScene {
                                 self.judge.result(),
                                 &self.res.config,
                                 self.res.res_pack.ending.clone(),
-                                self.upload_fn.as_ref().map(Arc::clone),
+                                if is_replay { None } else { self.upload_fn.as_ref().map(Arc::clone) },
                                 self.player.as_ref().map(|it| it.rks),
                                 historic_best,
-                                record_data,
-                                self.best_record.clone(),
+                                if is_replay { None } else { record_data },
+                                if is_replay { None } else { self.best_record.clone() },
                                 if self.res.config.show_avg_fps { self.get_avg_fps() } else { None },
                             )?)))
                         }
@@ -1493,6 +1940,7 @@ impl Scene for GameScene {
         {
             self.skip_done = true;
             self.track_skipped = true;
+            crate::ui::track_skip_sfx();
             self.skip_transition_progress = 0.0;
             self.skip_wait_timer = 0.0;
             self.skip_fade_out_progress = 0.0;
@@ -1506,11 +1954,49 @@ impl Scene for GameScene {
         let aspect_ratio = self.res.aspect_ratio;
         self.chart.update(&mut self.res);
 
+        // Health bar mod: deduct HP on Good/Bad/Miss, trigger skip when HP <= 0
+        if self.res.config.mods.contains(Mods::HEALTH_BAR)
+            && !self.skip_done
+            && matches!(self.state, State::Playing)
+        {
+            let counts = self.judge.counts();
+            let good_delta = counts[1].saturating_sub(self.last_judge_counts[1]);
+            let bad_delta = counts[2].saturating_sub(self.last_judge_counts[2]);
+            let miss_delta = counts[3].saturating_sub(self.last_judge_counts[3]);
+            if good_delta > 0 || bad_delta > 0 || miss_delta > 0 {
+                self.health -= (good_delta as f32) * 1.0
+                    + (bad_delta as f32) * 2.0
+                    + (miss_delta as f32) * 5.0;
+                self.last_judge_counts = counts;
+                if self.health <= 0.0 {
+                    self.health = 0.0;
+                    self.skip_done = true;
+                    self.track_skipped = true;
+                    self.skip_transition_progress = 0.0;
+                    self.skip_wait_timer = 0.0;
+                    self.skip_fade_out_progress = 0.0;
+                    self.skip_bar_active = false;
+                    self.skip_bar_retracting = false;
+                    self.skip_instant = true;
+                    #[cfg(target_env = "ohos")]
+                    miniquad::native::set_interceptor_state(false);
+                }
+            } else {
+                self.last_judge_counts = counts;
+            }
+        }
+
         self.update_lyrics(time);
+
+        let gamepad_frame = if self.res.config.use_keyboard {
+            crate::gamepad::last_frame()
+        } else {
+            GamepadFrame::default()
+        };
 
         let res = &mut self.res;
         if !self.skip_done {
-            if res.config.interactive && is_key_pressed(KeyCode::Space) {
+            if res.config.interactive && (is_key_pressed(KeyCode::Space) || gamepad_frame.menu_pressed) {
                 if tm.paused() {
                     if matches!(self.state, State::Playing) {
                         self.music.play()?;
@@ -1579,6 +2065,14 @@ impl Scene for GameScene {
             self.skip_alt_must_release = false;
         }
         let alt_s_down = !self.skip_alt_must_release && is_key_down(KeyCode::LeftAlt) && is_key_down(KeyCode::S);
+
+        // Gamepad LB+RB+LT+RT combo
+        let gp_nav = crate::gamepad::nav_input_static();
+        if self.skip_gp_combo_must_release && !gp_nav.skip_combo {
+            self.skip_gp_combo_must_release = false;
+        }
+        let gp_skip_down = !self.skip_gp_combo_must_release && gp_nav.skip_combo;
+
         if !self.skip_done {
             // detect four corners pressed
             let corner_margin = 0.2;
@@ -1602,19 +2096,17 @@ impl Scene for GameScene {
             }
             let all_four_corners = corners_pressed.iter().all(|&b| b);
             let corner_fingers_alive = if self.skip_bar_from_corners {
-                self.corner_skip_touch_ids.iter().all(|id| {
-                    id.map_or(false, |id| {
-                        touches().iter().any(|t| t.id == id && t.phase != TouchPhase::Ended)
-                    })
-                })
+                self.corner_skip_touch_ids
+                    .iter()
+                    .all(|id| id.map_or(false, |id| touches().iter().any(|t| t.id == id && t.phase != TouchPhase::Ended)))
             } else {
                 false
             };
-            let skip_activated = alt_s_down || (self.skip_bar_from_corners && corner_fingers_alive) || (all_four_corners && !self.skip_bar_active);
+            let skip_activated = alt_s_down || gp_skip_down || (self.skip_bar_from_corners && corner_fingers_alive) || (all_four_corners && !self.skip_bar_active);
 
             if skip_activated {
                 self.skip_bar_retracting = false;
-                self.skip_bar_from_corners = !alt_s_down;
+                self.skip_bar_from_corners = !alt_s_down && !gp_skip_down;
                 if !self.skip_bar_active {
                     self.skip_bar_active = true;
                     self.skip_bar_progress = 0.0;
@@ -1648,11 +2140,15 @@ impl Scene for GameScene {
                 if self.skip_countdown <= 0.0 {
                     self.skip_done = true;
                     self.track_skipped = true;
+                    crate::ui::track_skip_sfx();
                     self.skip_bar_active = false;
                     self.skip_bar_retracting = false;
                     self.skip_bar_from_corners = false;
                     self.skip_transition_progress = 0.0;
                     self.skip_wait_timer = 0.0;
+                    if gp_skip_down {
+                        self.skip_gp_combo_must_release = true;
+                    }
                 }
             } else if self.skip_bar_active {
                 if !self.skip_bar_retracting {
@@ -1747,6 +2243,22 @@ impl Scene for GameScene {
             .as_ref()
             .map(|it| if msaa { it.input() } else { it.output() })
             .or(res.camera.render_target);
+        if let Some(dbg) = &mut res.dynamic_bg {
+            let vp = ui.viewport;
+            dbg.update(tm.now() as f32, vp, Some(tm.now() as f32));
+            // 同步 Resource 持有的背景纹理句柄，因为 DynamicBackground 的 Clone 会创建独立的输出纹理
+            res.background = dbg.texture();
+        }
+
+        push_camera_state();
+        self.gl.quad_gl.viewport(None);
+        set_camera(&Camera2D {
+            zoom: vec2(1., -(ui.viewport.2 as f32 / ui.viewport.3 as f32)),
+            ..Default::default()
+        });
+        draw_background(*res.background, ui.viewport);
+        pop_camera_state();
+
         push_camera_state();
         set_camera(&Camera2D {
             zoom: vec2(1., -asp),
@@ -1755,7 +2267,7 @@ impl Scene for GameScene {
             ..Default::default()
         });
         clear_background(BLACK);
-        draw_background(*res.background);
+        draw_background(*res.background, ui.viewport);
         pop_camera_state();
 
         let chart_target_vp = if res.chart_target.is_some() {
@@ -1768,6 +2280,7 @@ impl Scene for GameScene {
         self.gl.quad_gl.viewport(chart_target_vp);
 
         let h = 1. / res.aspect_ratio;
+
         draw_rectangle(-1., -h, 2., h * 2., Color::new(0., 0., 0., res.alpha * res.info.background_dim));
 
         self.chart.render(ui, res);
@@ -1851,10 +2364,45 @@ impl Scene for GameScene {
             draw_rectangle(-1., -ui.top, 2., ui.top * 2., Color::new(0., 0., 0., p));
             pop_camera_state();
         }
+
+        // 实时性能监测（左上角）
+        if self.res.config.performance_monitor {
+            let current_time = tm.real_time();
+            crate::perf_monitor::PerfMonitor::update(current_time, 0.0);
+
+            let snap = crate::perf_monitor::PerfMonitor::snapshot();
+            let mut lines: Vec<String> = vec![format!("FPS {:.0}", snap.fps.max(0.0).min(9999.0))];
+
+            #[cfg(not(target_os = "android"))]
+            {
+                lines.push(format!("CPU {:.0}%", snap.cpu_usage));
+                lines.push(format!("MEM {:.0}%", snap.mem_usage));
+                lines.push(format!("GPU {:.0}%", snap.gpu_usage));
+                lines.push(format!("DISK {:.0}%", snap.disk_usage));
+            }
+
+            push_camera_state();
+            set_default_camera();
+            let font_size = 22.0f32;
+            let line_h = 26.0f32;
+            let pad_x = 10.0f32;
+            let pad_y = 10.0f32;
+            let bg_w = 130.0f32;
+            let bg_h = pad_y * 2.0 + lines.len() as f32 * line_h;
+            draw_rectangle(pad_x - 4.0, pad_y - 2.0, bg_w, bg_h, Color::new(0.0, 0.0, 0.0, 0.45));
+            for (i, line) in lines.iter().enumerate() {
+                draw_text(line, pad_x, pad_y + font_size + i as f32 * line_h, font_size, WHITE);
+            }
+            pop_camera_state();
+        }
         Ok(())
     }
 
     fn next_scene(&mut self, tm: &mut TimeManager) -> NextScene {
+        // Handle gamepad B-key back (only when nav is enabled, i.e., paused or not playing)
+        if self.nav_enabled() && crate::gamepad::take_back_pressed() && !self.should_exit && self.next_scene.is_none() {
+            self.should_exit = true;
+        }
         if self.should_exit || self.next_scene.is_some() {
             #[cfg(target_os = "windows")]
             windows_ime::enable();
@@ -1886,5 +2434,9 @@ impl Scene for GameScene {
         } else {
             NextScene::None
         }
+    }
+
+    fn nav_enabled(&self) -> bool {
+        !matches!(self.state, State::Playing) || self.game_paused
     }
 }

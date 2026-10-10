@@ -250,6 +250,11 @@ impl Scroller {
     pub fn size(&mut self, size: f32) {
         self.size = size;
     }
+
+    /// 内容超出可视区的最大滚动偏移（offset 的上限）
+    pub fn max_offset(&self) -> f32 {
+        self.size
+    }
 }
 
 pub enum ClipType {
@@ -317,7 +322,10 @@ impl Scroll {
     }
 
     pub fn update(&mut self, t: f32) {
-        let extra_scroll = if let Some(matrix) = self.matrix {
+        // 取走矩阵：只有本帧 render 过（矩阵被重新写入）的 Scroll 才能消费滚轮。
+        // 否则隐藏中的控件会拿着上次显示时的矩形把滚轮“吞掉”，
+        // 光标刚好落在那个旧位置时下层的列表就滚不动了。
+        let extra_scroll = if let Some(matrix) = self.matrix.take() {
             let (mx, my) = mouse_position();
             let vp = crate::ext::get_viewport();
             let pt = Point::new(
@@ -338,7 +346,9 @@ impl Scroll {
         } else {
             0.
         };
-        (if self.horizontal { &mut self.x_scroller } else { &mut self.y_scroller }).update(t, extra_scroll)
+        // Add right stick scrolling (positive Y in UI coords = scroll down)
+        let stick_scroll = crate::gamepad::right_stick_scroll();
+        (if self.horizontal { &mut self.x_scroller } else { &mut self.y_scroller }).update(t, extra_scroll + stick_scroll * 0.08)
     }
 
     pub fn contains(&self, touch: &Touch) -> bool {

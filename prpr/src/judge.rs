@@ -1,4 +1,4 @@
-//! Judgement system
+﻿//! Judgement system
 
 use crate::{
     config::Config,
@@ -162,11 +162,15 @@ pub(crate) struct JudgeInner {
     num_of_notes: u32,
     early_kind: [u32; 4],
     late_kind: [u32; 4],
+    /// XC-SIM 谱面：使用专属计分规则（满分 = 10000000 + 总Real Note数，无连击加成）。
+    xcsim: bool,
+    /// Shiny Pure（Perfect+，|diff| <= 50ms）数量，用于 Arcaea 式逐 Note 计分。
+    shiny_perfect: u32,
 }
 
 #[cfg(not(closed))]
 impl JudgeInner {
-    pub fn new(num_of_notes: u32) -> Self {
+    pub fn new(num_of_notes: u32, xcsim: bool) -> Self {
         Self {
             diffs: Vec::new(),
 
@@ -176,14 +180,13 @@ impl JudgeInner {
             num_of_notes,
             early_kind: [0; 4],
             late_kind: [0; 4],
+            xcsim,
+            shiny_perfect: 0,
         }
     }
 
     pub fn commit(&mut self, what: Judgement, diff: f64) {
         use Judgement::*;
-        if matches!(what, Judgement::Good) {
-            self.diffs.push(diff);
-        }
         if diff < 0. {
             self.early_kind[what as usize] += 1;
         } else if diff > 0. {
@@ -191,7 +194,17 @@ impl JudgeInner {
         }
         self.counts[what as usize] += 1;
         match what {
-            Perfect | Good => {
+            Perfect => {
+                // Shiny Pure（|diff| <= 50ms，即 Perfect+）额外 +1 分。
+                if diff.abs() <= 0.05 {
+                    self.shiny_perfect += 1;
+                }
+                self.combo += 1;
+                if self.combo > self.max_combo {
+                    self.max_combo = self.combo;
+                }
+            }
+            Good => {
                 self.combo += 1;
                 if self.combo > self.max_combo {
                     self.max_combo = self.combo;
@@ -203,6 +216,12 @@ impl JudgeInner {
         }
     }
 
+    pub fn record_timing_diff(&mut self, diff: f64) {
+        if diff.is_finite() {
+            self.diffs.push(diff);
+        }
+    }
+
     pub fn reset(&mut self) {
         self.combo = 0;
         self.max_combo = 0;
@@ -210,10 +229,22 @@ impl JudgeInner {
         self.diffs.clear();
         self.early_kind = [0; 4];
         self.late_kind = [0; 4];
+        self.shiny_perfect = 0;
     }
 
     pub fn accuracy(&self) -> f64 {
-        (self.counts[0] as f64 + self.counts[1] as f64 * 0.65) / self.num_of_notes as f64
+        if self.xcsim {
+            // XC-SIM: Shiny Pure (Perfect+, |diff|<=50ms) = 1.01, Pure (Perfect) = 1.00,
+            // Far (Good) = 0.65. 全 Perfect+ = 101%, 全 Perfect = 100%.
+            if self.num_of_notes == 0 {
+                return 0.;
+            }
+            let shiny = self.shiny_perfect as f64;
+            let perfect = (self.counts[0] - self.shiny_perfect) as f64;
+            (shiny * 1.01 + perfect * 1.00 + self.counts[1] as f64 * 0.65) / self.num_of_notes as f64
+        } else {
+            (self.counts[0] as f64 + self.counts[1] as f64 * 0.65) / self.num_of_notes as f64
+        }
     }
 
     pub fn real_time_accuracy(&self) -> f64 {
@@ -221,21 +252,51 @@ impl JudgeInner {
         if cnt == 0 {
             return 1.;
         }
-        (self.counts[0] as f64 + self.counts[1] as f64 * 0.65) / cnt as f64
+        if self.xcsim {
+            let shiny = self.shiny_perfect as f64;
+            let perfect = (self.counts[0] - self.shiny_perfect) as f64;
+            (shiny * 1.01 + perfect * 1.00 + self.counts[1] as f64 * 0.65) / cnt as f64
+        } else {
+            (self.counts[0] as f64 + self.counts[1] as f64 * 0.65) / cnt as f64
+        }
     }
 
     pub fn score(&self) -> u32 {
-        const TOTAL: u32 = 1000000;
-        if self.counts[0] == self.num_of_notes {
-            TOTAL
-        } else {
-            let score = (0.9 * self.accuracy() + self.max_combo as f64 / self.num_of_notes as f64 * 0.1) * TOTAL as f64;
+        if self.xcsim {
+            // Arcaea 式逐 Note 计分：
+            //   N = 总 Note 数，base = 10,000,000 / N
+            //   Shiny Pure (Perfect+, |diff|<=50ms) = base + 1
+            //   Pure (Perfect, Early/Late)           = base
+            //   Far (Good)                           = base * 0.5
+            //   Lost (Bad/Miss)                      = 0
+            // 最高分 = N * (base + 1) = 10,000,000 + N
+            if self.num_of_notes == 0 {
+                return 0;
+            }
+            let base = 10000000.0 / self.num_of_notes as f64;
+            let shiny = self.shiny_perfect as f64;
+            let plain = (self.counts[0] - self.shiny_perfect) as f64;
+            let far = self.counts[1] as f64;
+            let score = shiny * (base + 1.) + plain * base + far * (base * 0.5);
             score.round() as u32
+        } else {
+            const TOTAL: u32 = 1000000;
+            if self.counts[0] == self.num_of_notes {
+                TOTAL
+            } else {
+                let score = (0.9 * self.accuracy() + self.max_combo as f64 / self.num_of_notes as f64 * 0.1) * TOTAL as f64;
+                score.round() as u32
+            }
         }
     }
 
     pub fn result(&self) -> PlayResult {
         let early = self.diffs.iter().filter(|it| **it < 0.).count() as u32;
+        let std = if self.diffs.is_empty() {
+            0.
+        } else {
+            (self.diffs.iter().map(|it| it * it).sum::<f64>() / self.diffs.len() as f64).sqrt() as f32
+        };
         PlayResult {
             score: self.score(),
             accuracy: self.accuracy(),
@@ -244,9 +305,11 @@ impl JudgeInner {
             counts: self.counts,
             early,
             late: self.diffs.len() as u32 - early,
-            std: 0.,
+            std,
             early_kind: self.early_kind,
             late_kind: self.late_kind,
+            xcsim: self.xcsim,
+            shiny_perfect: self.shiny_perfect,
         }
     }
 
@@ -279,6 +342,21 @@ pub struct Judge {
 
     pub(crate) inner: JudgeInner,
     pub judgements: RefCell<Judgements>,
+
+    /// 判定时间窗口（XC-SIM 与官方不同）。
+    limit_perfect: f64,
+    limit_good: f64,
+    limit_bad: f64,
+
+    /// 最近若干次判定：(判定种类, 偏移, 时间)。每个指示独立渐隐，避免密集 Note 时重置。
+    pub early_late_list: Vec<(Judgement, f64, f64)>,
+
+    // --- Replay support ---
+    /// Accumulated replay data when recording.
+    replay_record: Option<crate::replay::ReplayData>,
+    /// Sorted list of replay events to play back, plus our read index.
+    replay_playback: Option<Vec<crate::replay::NoteRecord>>,
+    replay_playback_idx: usize,
 }
 
 #[derive(Default)]
@@ -300,6 +378,17 @@ pub fn take_wheel() -> (f32, f32) {
 
 impl Judge {
     pub fn new(chart: &Chart) -> Self {
+        Self::new_xcsim(chart, false)
+    }
+
+    /// 创建判定器；`xcsim` 为 true 时使用 XC-SIM 专属判定窗口与计分规则。
+    /// XC-SIM 判定：Perfect(±80ms) / Good(±120ms) / Bad(±140ms)。
+    pub fn new_xcsim(chart: &Chart, xcsim: bool) -> Self {
+        let (limit_perfect, limit_good, limit_bad) = if xcsim {
+            (0.08, 0.12, 0.14)
+        } else {
+            (LIMIT_PERFECT, LIMIT_GOOD, LIMIT_BAD)
+        };
         let notes = chart
             .lines
             .iter()
@@ -316,9 +405,67 @@ impl Judge {
 
             key_down_count: 0,
 
-            inner: JudgeInner::new(chart.lines.iter().map(|it| it.notes.iter().filter(|it| !it.fake).count() as u32).sum()),
+            inner: JudgeInner::new(
+                chart.lines.iter().map(|it| it.notes.iter().filter(|it| !it.fake).count() as u32).sum(),
+                xcsim,
+            ),
             judgements: RefCell::new(Vec::new()),
+
+            limit_perfect,
+            limit_good,
+            limit_bad,
+            early_late_list: Vec::new(),
+            replay_record: None,
+            replay_playback: None,
+            replay_playback_idx: 0,
         }
+    }
+
+    /// Begin recording judgements into a fresh `ReplayData`. Clears any
+    /// previously-recorded events for this Judge.
+    pub fn start_recording(
+        &mut self,
+        chart_id: Option<i32>,
+        chart_name: String,
+        chart_local_path: String,
+        chart_level: String,
+        chart_offset: f32,
+        speed: f32,
+    ) {
+        let mut data = crate::replay::ReplayData::new(chart_id, chart_name);
+        data.chart_local_path = chart_local_path;
+        data.chart_level = chart_level;
+        data.chart_offset = Some(chart_offset);
+        data.speed = speed;
+        self.replay_record = Some(data);
+    }
+
+    /// Consume the recorded `ReplayData`, leaving recording disabled.
+    pub fn take_replay_record(&mut self) -> Option<crate::replay::ReplayData> {
+        self.replay_record.take()
+    }
+
+    pub fn discard_replay_record(&mut self) {
+        self.replay_record = None;
+    }
+
+    #[inline]
+    pub fn is_recording_replay(&self) -> bool {
+        self.replay_record.is_some()
+    }
+
+    /// Enter playback mode. Consumes the provided replay events.
+    pub fn set_replay_data(&mut self, data: crate::replay::ReplayData) {
+        let mut records = data.records;
+        records.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+        self.replay_playback = Some(records);
+        self.replay_playback_idx = 0;
+    }
+
+    /// Whether this Judge is currently driving gameplay from a replay.
+    #[inline]
+    pub fn is_replaying(&self) -> bool {
+        self.replay_playback.is_some()
     }
 
     pub fn reset(&mut self) {
@@ -326,6 +473,11 @@ impl Judge {
         self.trackers.clear();
         self.inner.reset();
         self.judgements.borrow_mut().clear();
+        self.early_late_list.clear();
+        if let Some(rec) = self.replay_record.as_mut() {
+            rec.records.clear();
+        }
+        self.replay_playback_idx = 0;
     }
 
     /// Advance note pointers past notes before time `t`, marking them as judged.
@@ -344,9 +496,125 @@ impl Judge {
         self.last_time = t;
     }
 
-    pub fn commit(&mut self, t: f64, what: Judgement, line_id: u32, note_id: u32, diff: f64) {
+    /// Rebuild replay playback state at time `t` without playing sounds or FX.
+    /// Used by replay seeking while paused.
+    pub fn seek_replay_to(&mut self, chart: &mut Chart, t: f64) {
+        if self.replay_playback.is_none() {
+            self.advance_to(chart, t);
+            return;
+        }
+
+        self.notes.iter_mut().for_each(|it| it.1 = 0);
+        self.trackers.clear();
+        self.inner.reset();
+        self.judgements.borrow_mut().clear();
+        self.replay_playback_idx = 0;
+
+        let target_idx = self
+            .replay_playback
+            .as_ref()
+            .map(|records| records.iter().take_while(|record| record.time <= t).count())
+            .unwrap_or_default();
+
+        for idx in 0..target_idx {
+            let rec = {
+                let records = self.replay_playback.as_ref().unwrap();
+                records[idx].clone()
+            };
+            self.apply_replay_record_for_seek(chart, rec);
+        }
+        self.replay_playback_idx = target_idx;
+
+        for (line, (idx, st)) in chart.lines.iter_mut().zip(self.notes.iter_mut()) {
+            for id in &idx[*st..] {
+                let note = &mut line.notes[*id as usize];
+                if let JudgeStatus::Hold(..) = note.judge {
+                    if let NoteKind::Hold { end_time, .. } = note.kind {
+                        if t >= end_time {
+                            note.judge = JudgeStatus::Judged;
+                        }
+                    }
+                }
+            }
+            while idx
+                .get(*st)
+                .is_some_and(|id| matches!(line.notes[*id as usize].judge, JudgeStatus::Judged))
+            {
+                *st += 1;
+            }
+        }
+
+        self.judgements.borrow_mut().clear();
+        self.last_time = t;
+    }
+
+    fn apply_replay_record_for_seek(&mut self, chart: &mut Chart, rec: crate::replay::NoteRecord) {
+        let line_idx = rec.line_id as usize;
+        let note_idx = rec.note_id as usize;
+        if line_idx >= chart.lines.len() || note_idx >= chart.lines[line_idx].notes.len() {
+            return;
+        }
+
+        if rec.judgment.is_hold_prejudge() {
+            let perfect = matches!(rec.judgment, crate::replay::ReplayJudgement::HoldPerfect);
+            let note = &mut chart.lines[line_idx].notes[note_idx];
+            if matches!(note.judge, JudgeStatus::NotJudged) {
+                note.judge = JudgeStatus::Hold(perfect, rec.time, rec.offset, false, f64::INFINITY);
+            }
+            return;
+        }
+
+        let Some(judgement) = rec.judgment.to_judgement() else {
+            return;
+        };
+        let note_kind = chart.lines[line_idx].notes[note_idx].kind.clone();
+        chart.lines[line_idx].notes[note_idx].judge = JudgeStatus::Judged;
+
+        let timing_diff = if matches!(judgement, Judgement::Miss) || matches!(note_kind, NoteKind::Drag | NoteKind::Flick) {
+            None
+        } else {
+            Some(rec.offset)
+        };
+        self.commit_with_timing_diff(rec.time, judgement, rec.line_id, rec.note_id, rec.offset, timing_diff);
+    }
+
+    fn commit_with_timing_diff(&mut self, t: f64, what: Judgement, line_id: u32, note_id: u32, diff: f64, timing_diff: Option<f64>) {
         self.judgements.borrow_mut().push((t, line_id, note_id, Ok(what)));
+        #[cfg(closed)]
+        self.inner.commit(what, diff as f32);
+        #[cfg(not(closed))]
         self.inner.commit(what, diff);
+        #[cfg(not(closed))]
+        if let Some(timing_diff) = timing_diff {
+            self.inner.record_timing_diff(timing_diff);
+        }
+
+        // Append to replay record buffer if we are recording.
+        if let Some(rec) = self.replay_record.as_mut() {
+            rec.records.push(crate::replay::NoteRecord {
+                time: t,
+                line_id,
+                note_id,
+                judgment: crate::replay::ReplayJudgement::from_commit(Ok(what)),
+                offset: diff,
+            });
+        }
+    }
+
+    /// 记录一次判定。
+    /// `is_hold` 为 true（Hold/长条与自动演示）时不记录 Early/Late 指示。
+    pub fn commit(&mut self, t: f64, what: Judgement, line_id: u32, note_id: u32, diff: f64, is_hold: bool) {
+        // 记录判定，供 HUD 独立显示 Early/Late。Hold/长条（及自动演示）不记录。
+        if !is_hold {
+            self.early_late_list.push((what, diff, t));
+            // 只保留最近若干条，避免无限增长。
+            if self.early_late_list.len() > 32 {
+                self.early_late_list.drain(..self.early_late_list.len() - 32);
+            }
+        }
+        // Miss 不计入 timing 统计
+        let timing_diff = if matches!(what, Judgement::Miss) { None } else { Some(diff) };
+        self.commit_with_timing_diff(t, what, line_id, note_id, diff, timing_diff);
     }
 
     #[inline]
@@ -371,6 +639,10 @@ impl Judge {
         };
         repeat_all_miniquad_input(&mut handler, *SUBSCRIBER_ID);
         handler.finalize();
+        let mut pending = crate::gamepad::take_pending();
+        handler.status.key_delta += pending.key_delta;
+        handler.status.keys_down += pending.keys_down;
+        handler.status.touches.append(&mut pending.touches);
         TOUCHES.with(|it| {
             *it.borrow_mut() = handler.status;
         });
@@ -410,6 +682,10 @@ impl Judge {
     }
 
     pub fn update(&mut self, res: &mut Resource, chart: &mut Chart, bad_notes: &mut Vec<BadNote>) {
+        if self.is_replaying() {
+            self.replay_update(res, chart, bad_notes);
+            return;
+        }
         if res.config.autoplay() {
             self.auto_play_update(res, chart);
             return;
@@ -560,7 +836,7 @@ impl Judge {
                 continue;
             }
             let t = time_of(touch);
-            let mut closest = (None, X_DIFF_MAX, LIMIT_BAD, LIMIT_BAD + (X_DIFF_MAX / NOTE_WIDTH_RATIO_BASE - 1.).max(0.) * DIST_FACTOR);
+            let mut closest = (None, X_DIFF_MAX, self.limit_bad, self.limit_bad + (X_DIFF_MAX / NOTE_WIDTH_RATIO_BASE - 1.).max(0.) * DIST_FACTOR);
             for (line_id, ((line, pos), (idx, st))) in chart.lines.iter_mut().zip(pos.iter()).zip(self.notes.iter_mut()).enumerate() {
                 let Some(pos) = pos[id] else {
                     continue;
@@ -586,15 +862,15 @@ impl Judge {
                     }
                     if dt
                         > if matches!(note.kind, NoteKind::Click) {
-                            LIMIT_BAD - LIMIT_PERFECT * (dist - 0.9).max(0.)
+                            self.limit_bad - self.limit_perfect * (dist - 0.9).max(0.)
                         } else {
-                            LIMIT_GOOD
+                            self.limit_good
                         }
                     {
                         continue;
                     }
                     let dt = if matches!(note.kind, NoteKind::Flick | NoteKind::Drag) {
-                        dt + LIMIT_GOOD
+                        dt + self.limit_good
                     } else {
                         dt
                     };
@@ -616,25 +892,44 @@ impl Judge {
                     if matches!(note.kind, NoteKind::Flick) {
                         continue; // to next loop
                     }
-                    if dt <= LIMIT_GOOD || matches!(note.kind, NoteKind::Hold { .. }) {
+                    if dt <= self.limit_good || matches!(note.kind, NoteKind::Hold { .. }) {
                         match note.kind {
                             NoteKind::Click => {
                                 note.judge = JudgeStatus::Judged;
-                                judgements.push((if dt <= LIMIT_PERFECT { Judgement::Perfect } else { Judgement::Good }, line_id, id, Some(t)));
+                                judgements.push((if dt <= self.limit_perfect { Judgement::Perfect } else { Judgement::Good }, line_id, id, Some(t)));
                             }
                             NoteKind::Hold { .. } => {
                                 note.hitsound.play(res);
-                                self.judgements.borrow_mut().push((t, line_id as _, id, Err(dt <= LIMIT_PERFECT)));
-                                note.judge = JudgeStatus::Hold(dt <= LIMIT_PERFECT, t, t, false, f64::INFINITY);
+                                self.judgements.borrow_mut().push((t, line_id as _, id, Err(dt <= self.limit_perfect)));
+                                note.judge = JudgeStatus::Hold(dt <= self.limit_perfect, t, t, false, f64::INFINITY);
+                                if let Some(rec) = self.replay_record.as_mut() {
+                                    rec.records.push(crate::replay::NoteRecord {
+                                        time: t,
+                                        line_id: line_id as _,
+                                        note_id: id,
+                                        judgment: if dt <= self.limit_perfect {
+                                            crate::replay::ReplayJudgement::HoldPerfect
+                                        } else {
+                                            crate::replay::ReplayJudgement::HoldGood
+                                        },
+                                        offset: (t - note.time) / spd,
+                                    });
+                                }
                             }
                             _ => unreachable!(),
                         };
                     } else {
                         // prevent extra judgements
                         if matches!(note.judge, JudgeStatus::NotJudged) {
-                            // keep the note after bad judgement
-                            line.notes[id as usize].judge = JudgeStatus::PreJudge;
-                            judgements.push((Judgement::Bad, line_id, id, None));
+                            if t > note.time {
+                                // 过晚点击：不再记 Bad，直接判定为 Miss 并消除音符
+                                line.notes[id as usize].judge = JudgeStatus::Judged;
+                                judgements.push((Judgement::Miss, line_id, id, None));
+                            } else {
+                                // 过早点击：保留音符，记 Bad（音符仍在，可再次点击）
+                                line.notes[id as usize].judge = JudgeStatus::PreJudge;
+                                judgements.push((Judgement::Bad, line_id, id, None));
+                            }
                         }
                     }
                 } else {
@@ -667,14 +962,14 @@ impl Judge {
             {
                 let note = &mut chart.lines[line_id].notes[id as usize];
                 let dt = (t - note.time).abs() / spd;
-                if dt <= if matches!(note.kind, NoteKind::Click) { LIMIT_BAD } else { LIMIT_GOOD } {
+                if dt <= if matches!(note.kind, NoteKind::Click) { self.limit_bad } else { self.limit_good } {
                     match note.kind {
                         NoteKind::Click => {
                             note.judge = JudgeStatus::Judged;
                             judgements.push((
-                                if dt <= LIMIT_PERFECT {
+                                if dt <= self.limit_perfect {
                                     Judgement::Perfect
-                                } else if dt <= LIMIT_GOOD {
+                                } else if dt <= self.limit_good {
                                     Judgement::Good
                                 } else {
                                     Judgement::Bad
@@ -686,8 +981,21 @@ impl Judge {
                         }
                         NoteKind::Hold { .. } => {
                             note.hitsound.play(res);
-                            self.judgements.borrow_mut().push((t, line_id as _, id, Err(dt <= LIMIT_PERFECT)));
-                            note.judge = JudgeStatus::Hold(dt <= LIMIT_PERFECT, t, (t - note.time) / spd, false, f64::INFINITY);
+                            self.judgements.borrow_mut().push((t, line_id as _, id, Err(dt <= self.limit_perfect)));
+                            note.judge = JudgeStatus::Hold(dt <= self.limit_perfect, t, (t - note.time) / spd, false, f64::INFINITY);
+                            if let Some(rec) = self.replay_record.as_mut() {
+                                rec.records.push(crate::replay::NoteRecord {
+                                    time: t,
+                                    line_id: line_id as _,
+                                    note_id: id,
+                                    judgment: if dt <= self.limit_perfect {
+                                        crate::replay::ReplayJudgement::HoldPerfect
+                                    } else {
+                                        crate::replay::ReplayJudgement::HoldGood
+                                    },
+                                    offset: (t - note.time) / spd,
+                                });
+                            }
                         }
                         _ => unreachable!(),
                     };
@@ -702,7 +1010,7 @@ impl Judge {
                 let note = &mut line.notes[*id as usize];
                 if let NoteKind::Hold { end_time, .. } = &note.kind {
                     if let JudgeStatus::Hold(.., ref mut pre_judge, ref mut up_time) = note.judge {
-                        if (*end_time - t) / spd <= LIMIT_BAD {
+                        if (*end_time - t) / spd <= self.limit_bad {
                             *pre_judge = true;
                             continue;
                         }
@@ -731,12 +1039,12 @@ impl Judge {
                 }
                 // process miss
                 let dt = (t - note.time) / spd;
-                if dt > LIMIT_BAD {
+                if dt > self.limit_bad {
                     note.judge = JudgeStatus::Judged;
                     judgements.push((Judgement::Miss, line_id, *id, None));
                     continue;
                 }
-                if -dt > LIMIT_BAD {
+                if -dt > self.limit_bad {
                     break;
                 }
                 if !matches!(note.kind, NoteKind::Drag) && (self.key_down_count == 0 || !matches!(note.kind, NoteKind::Flick)) {
@@ -750,7 +1058,7 @@ impl Judge {
                     || pos.iter().any(|it| {
                         it.is_some_and(|it| {
                             let dx = (it.x - x).abs() as f64 / note.judge_area as f64;
-                            dx <= X_DIFF_MAX && dt <= (LIMIT_BAD - LIMIT_PERFECT * (dx - 0.9).max(0.))
+                            dx <= X_DIFF_MAX && dt <= (self.limit_bad - self.limit_perfect * (dx - 0.9).max(0.))
                         })
                     })
                 {
@@ -773,7 +1081,7 @@ impl Judge {
                     }
                 }
                 // TODO adjust
-                let ghost_t = t + LIMIT_GOOD;
+                let ghost_t = t + self.limit_good;
                 if matches!(note.kind, NoteKind::Click) {
                     if ghost_t < note.time {
                         break;
@@ -814,6 +1122,7 @@ impl Judge {
                 } else {
                     (diff.unwrap_or(t) - note.time) / spd
                 },
+                matches!(note.kind, NoteKind::Hold { .. }),
             );
             if matches!(note.kind, NoteKind::Hold { .. }) {
                 continue;
@@ -870,6 +1179,145 @@ impl Judge {
         self.last_time = t / spd;
     }
 
+    /// Drive note state from a recorded replay. Replaces both `update` and
+    /// `auto_play_update` when `is_replaying()` is true. Commits judgements
+    /// matching the recording at the times they were originally committed.
+    fn replay_update(&mut self, res: &mut Resource, chart: &mut Chart, bad_notes: &mut Vec<BadNote>) {
+        let t = res.time;
+        let spd = res.config.speed as f64;
+        let Some(records) = self.replay_playback.as_ref() else {
+            return;
+        };
+
+        // Consume events whose time <= current game time.
+        let mut pending: Vec<crate::replay::NoteRecord> = Vec::new();
+        while self.replay_playback_idx < records.len() && records[self.replay_playback_idx].time <= t {
+            pending.push(records[self.replay_playback_idx].clone());
+            self.replay_playback_idx += 1;
+        }
+
+        for rec in pending {
+            let line_idx = rec.line_id as usize;
+            let note_idx = rec.note_id as usize;
+            if line_idx >= chart.lines.len() {
+                continue;
+            }
+            if note_idx >= chart.lines[line_idx].notes.len() {
+                continue;
+            }
+
+            let is_hold_prejudge = rec.judgment.is_hold_prejudge();
+            let judgement = rec.judgment.to_judgement();
+
+            // Prepare note for rendering FX.
+            {
+                let line = &mut chart.lines[line_idx];
+                let note = &mut line.notes[note_idx];
+                line.object.set_time(rec.time);
+                note.object.set_time(rec.time);
+            }
+
+            if is_hold_prejudge {
+                let perfect = matches!(rec.judgment, crate::replay::ReplayJudgement::HoldPerfect);
+                {
+                    let note = &mut chart.lines[line_idx].notes[note_idx];
+                    if matches!(note.judge, JudgeStatus::NotJudged) {
+                        note.judge = JudgeStatus::Hold(perfect, rec.time, rec.offset, false, f64::INFINITY);
+                        note.hitsound.clone().play(res);
+                    }
+                }
+                self.judgements.borrow_mut().push((rec.time, rec.line_id, rec.note_id, Err(perfect)));
+                continue;
+            }
+
+            let Some(judgement) = judgement else { continue };
+            let note_kind = chart.lines[line_idx].notes[note_idx].kind.clone();
+            let hitsound = chart.lines[line_idx].notes[note_idx].hitsound.clone();
+
+            {
+                let note = &mut chart.lines[line_idx].notes[note_idx];
+                note.judge = JudgeStatus::Judged;
+            }
+
+            let timing_diff = if matches!(judgement, Judgement::Miss) || matches!(note_kind, NoteKind::Drag | NoteKind::Flick) {
+                None
+            } else {
+                Some(rec.offset)
+            };
+            self.commit_with_timing_diff(rec.time, judgement, rec.line_id, rec.note_id, rec.offset, timing_diff);
+
+            if matches!(note_kind, NoteKind::Hold { .. }) {
+                continue;
+            }
+            let line_tr = chart.lines[line_idx].now_transform(res, &chart.lines);
+            let note_tr = chart.lines[line_idx].notes[note_idx].object.now(res);
+            match judgement {
+                Judgement::Perfect => {
+                    res.with_model(line_tr * note_tr, |res| {
+                        let rot = chart.lines[line_idx].notes[note_idx].rotation(&chart.lines[line_idx]);
+                        res.emit_at_origin(rot, res.res_pack.info.fx_perfect());
+                    });
+                    hitsound.play(res);
+                }
+                Judgement::Good => {
+                    res.with_model(line_tr * note_tr, |res| {
+                        let rot = chart.lines[line_idx].notes[note_idx].rotation(&chart.lines[line_idx]);
+                        res.emit_at_origin(rot, res.res_pack.info.fx_good());
+                    });
+                    hitsound.play(res);
+                }
+                Judgement::Bad => {
+                    // Mirror the normal-gameplay Bad path: spawn a fading
+                    // dark note copy at the press location instead of
+                    // letting the note vanish.
+                    let line = &chart.lines[line_idx];
+                    let note = &line.notes[note_idx];
+                    if !matches!(note.kind, NoteKind::Hold { .. }) {
+                        let mut mat = line_tr;
+                        if !note.above {
+                            mat.append_nonuniform_scaling_mut(&Vector::new(1., -1.));
+                        }
+                        let incline_sin = line.incline.now_opt().map(|it| it.to_radians().sin()).unwrap_or_default();
+                        mat *= note.now_transform(
+                            res,
+                            &line.ctrl_obj.borrow_mut(),
+                            ((note.height - line.height.now() as f64) / res.aspect_ratio as f64 * note.speed) as f32,
+                            incline_sin,
+                        );
+                        bad_notes.push(BadNote {
+                            time: rec.time,
+                            kind: note.kind.clone(),
+                            matrix: mat,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Hold notes: flush Judged state when we pass their end_time.
+        for (line, (idx, st)) in chart.lines.iter_mut().zip(self.notes.iter_mut()) {
+            for id in &idx[*st..] {
+                let note = &mut line.notes[*id as usize];
+                if let JudgeStatus::Hold(..) = note.judge {
+                    if let NoteKind::Hold { end_time, .. } = note.kind {
+                        if t >= end_time {
+                            note.judge = JudgeStatus::Judged;
+                        }
+                    }
+                }
+            }
+            while idx
+                .get(*st)
+                .is_some_and(|id| matches!(line.notes[*id as usize].judge, JudgeStatus::Judged))
+            {
+                *st += 1;
+            }
+        }
+
+        self.last_time = t / spd;
+    }
+
     fn auto_play_update(&mut self, res: &mut Resource, chart: &mut Chart) {
         let t = res.time;
         let spd = res.config.speed as f64;
@@ -909,7 +1357,7 @@ impl Judge {
             }
         }
         for (line_id, id) in judgements.into_iter() {
-            self.commit(t, Judgement::Perfect, line_id as _, id, 0.);
+            self.commit(t, Judgement::Perfect, line_id as _, id, 0., true);
             let (note_transform, note_hitsound) = {
                 let line = &mut chart.lines[line_id];
                 let note = &mut line.notes[id as usize];
@@ -1030,6 +1478,8 @@ pub struct PlayResult {
     pub std: f32,
     pub early_kind: [u32; 4],
     pub late_kind: [u32; 4],
+    pub xcsim: bool,
+    pub shiny_perfect: u32,
 }
 
 pub fn icon_index(score: u32, full_combo: bool) -> usize {
@@ -1042,5 +1492,18 @@ pub fn icon_index(score: u32, full_combo: bool) -> usize {
         (1000000, _) => 7,
         (_, false) => 5,
         (_, true) => 6,
+    }
+}
+
+/// XC-SIM 评级：AP(>=10000000) V(>=9900000) S(>=9800000) A(>=9500000) B(>=9200000) C(>=8900000) F(<8900000)
+pub fn icon_index_xcsim(score: u32) -> usize {
+    match score {
+        x if x >= 10000000 => 7, // AP (phi)
+        x if x >= 9900000 => 5,  // V
+        x if x >= 9800000 => 4,  // S
+        x if x >= 9500000 => 3,  // A
+        x if x >= 9200000 => 2,  // B
+        x if x >= 8900000 => 1,  // C
+        _ => 0,                  // F
     }
 }

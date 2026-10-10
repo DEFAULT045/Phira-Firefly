@@ -2,6 +2,7 @@
 members = [
 	"prpr",
 	"prpr-avc",
+	"prpr-render",
 	"prpr-pbc",
 	"prpr-l10n",
 	"phira",
@@ -14,7 +15,7 @@ resolver = "2"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(closed)'] }
 
 [workspace.package]
-version = "0.7.1"
+version = "0.9.4-CBT3"
 edition = "2021"
 license = "GPL-3.0-only"
 
@@ -60,11 +61,12 @@ objc2-uniform-type-identifiers = "0.3.2"
 macroquad = { git = "https://github.com/Mivik/prpr-macroquad", rev = "b2eab29", default-features = false }
 miniquad = { git = "https://github.com/Mivik/prpr-miniquad", rev = "0c525a3" }
 phira = { path = "phira", default-features = false }
-phira-mp-client = { git = "https://github.com/TeamFlos/phira-mp", rev = "6967475" }
-phira-mp-common = { git = "https://github.com/TeamFlos/phira-mp", rev = "6967475" }
+phira-mp-client = { git = "https://github.com/tiancra/phira-mp", branch = "main" }
+phira-mp-common = { git = "https://github.com/tiancra/phira-mp", branch = "main" }
 prpr = { path = "prpr", default-features = false }
 prpr-avc = { path = "prpr-avc" }
 prpr-l10n = { path = "prpr-l10n" }
+prpr-render = { path = "prpr-render" }
 sasa = { git = "https://github.com/Mivik/sasa", rev = "e76229b", default-features = false }
 
 [profile.release]

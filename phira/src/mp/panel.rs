@@ -1,6 +1,6 @@
 use crate::{
     client::{Chart, Ptr, UserManager},
-    dir, get_data,
+    dir, get_data, get_data_mut,
     mp::L10N_LOCAL,
     scene::{Downloading, SongScene, RECORD_ID},
 };
@@ -14,7 +14,7 @@ use prpr::{
     core::{Smooth, Tweenable},
     ext::{poll_future, semi_black, semi_white, LocalTask, RectExt, SafeTexture},
     info::ChartInfo,
-    scene::{request_input, return_input, show_error, show_message, take_input, GameMode, NextScene},
+    scene::{request_input, return_input, show_error, show_message, take_input, GameMode, NextScene, mp_reset_result, mp_take_result},
     task::Task,
     time::TimeManager,
     ui::{DRectButton, DrawText},
@@ -101,6 +101,30 @@ pub struct MPPanel {
     // true for request_start, false for ready
     download_next: bool,
 
+    // LocalChart 本地谱面同步
+    local_chart: Option<(String, String)>,   // 当前分享的本地谱面 (UUID id, name)
+    serving: Option<Arc<crate::mp::serve::ChartServer>>, // 房主：本地下载服务器
+    syncing: Option<Arc<crate::mp::serve::ChartSyncing>>, // 玩家：正在从房主同步谱面
+    // 玩家收到下载指令但尚未点击"准备"时的待下载信息 (addr, port, chart_id, chart_name)
+    pending_download: Option<(String, u16, String, String)>,
+    local_chart_task: Option<Task<Result<()>>>,
+    // 房主：已点击"开始游戏"，分享中（按钮显示"取消准备"）
+    host_started: bool,
+    // 玩家：已点击"准备"（按钮显示"取消准备"，直到进入游玩）
+    local_ready: bool,
+    // 玩家取消准备时，用于中止下载完成后的自动就绪
+    local_download_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    // 房主正在分享（上传谱面包 + 等待玩家下载）。与 serving 解耦：
+    // 实际传输走 game 连接，本地 HTTP 监听器启动失败也不影响分享。
+    host_sharing: bool,
+    // 房主上传任务的取消标记：取消分享/停止服务后置位，上传任务在 send_chart 前检查，
+    // 避免取消后仍在执行的上传任务把分享"重启"。
+    host_upload_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    // 本次会话生成的本地谱面临时目录 id（即 `download/{id}` 的 UUID），用于在分享结束后删除该副本。
+    // 与 local_chart 分开记录：local_chart 在进入 Playing 时就会被清空，而临时目录必须
+    // 一直保留到分享结束（取消 / 游玩结束 / 改选在线谱面）才可删除。
+    staged_chart_id: Option<String>,
+
     chart_id: Option<i32>,
     game_start_consumed: bool,
     need_upload: bool,
@@ -115,9 +139,9 @@ pub struct MPPanel {
     user_list_btn: DRectButton,
     user_list_p: Smooth<f32>,
     icon_user: SafeTexture,
-    
+
     startup_args: Option<StartupArgs>,
-    
+
     // 临时服务器地址，用于启动参数指定的服务器
     temp_mp_address: Option<String>,
 }
@@ -161,6 +185,18 @@ impl MPPanel {
             downloading: None,
             download_next: false,
 
+            local_chart: None,
+            serving: None,
+            syncing: None,
+            pending_download: None,
+            local_chart_task: None,
+            host_started: false,
+            local_ready: false,
+            local_download_cancel: None,
+            host_sharing: false,
+            host_upload_cancel: None,
+            staged_chart_id: None,
+
             chart_id: None,
             game_start_consumed: false,
             need_upload: false,
@@ -175,9 +211,9 @@ impl MPPanel {
             user_list_btn: DRectButton::new(),
             user_list_p: Smooth::default(),
             icon_user,
-            
+
             startup_args: None,
-            
+
             temp_mp_address: None,
         }
     }
@@ -191,8 +227,10 @@ impl MPPanel {
             || self.create_room_task.is_some()
             || self.chat_task.is_some()
             || self.download_task.is_some()
+            || self.local_chart_task.is_some()
             || self.task.is_some()
             || self.scene_task.is_some()
+            || self.join_room_task.is_some()
     }
 
     pub fn connect(&mut self) {
@@ -201,6 +239,10 @@ impl MPPanel {
             return;
         };
         let addr = self.temp_mp_address.as_ref().unwrap_or(&get_data().config.mp_address).clone();
+        if addr.is_empty() {
+            show_message(mtl!("connect-no-server")).error();
+            return;
+        }
         self.connect_task = Some(Task::new(async move {
             let client = Client::new(TcpStream::connect(addr).await?).await?;
             client
@@ -230,10 +272,10 @@ impl MPPanel {
     pub fn handle_startup_args(&mut self, join_room: Option<RoomId>, create_room: Option<RoomId>, mp_address: Option<String>) {
         // 显示多人联机面板（使用与点击按钮时相同的方式）
         self.show(prpr::time::TimeManager::default().real_time() as _);
-        
+
         // 设置临时服务器地址
         self.temp_mp_address = mp_address;
-        
+
         if self.client.is_none() {
             self.connect();
         }
@@ -259,18 +301,93 @@ impl MPPanel {
             show_message(mtl!("select-chart-host-only")).error();
             return;
         }
+        if !matches!(client.blocking_room_state(), Some(RoomState::SelectChart(_) | RoomState::LocalChart)) {
+            show_message(mtl!("select-chart-not-now")).error();
+            return;
+        }
+        // 切换到在线谱面：清除之前选择的本地谱面分享状态，
+        // 避免开始游戏时仍错误地加载旧的本地谱面（download/{uuid}）。
+        self.local_chart = None;
+        self.pending_download = None;
+        self.syncing = None;
+        self.local_download_cancel = None;
+        self.host_started = false;
+        self.local_ready = false;
+        self.stop_serving();
+        self.task = Some(Task::new(async move {
+            client.select_online_chart(id).await.with_context(|| mtl!("select-chart-failed"))?;
+            Ok(())
+        }));
+    }
+
+    /// 判断当前服务器是否允许上传本地谱面（仅 mp.tianstudio.top / mp.ratzen.top，忽略端口）。
+    fn server_allows_local_chart(&self) -> bool {
+        const ALLOWED: &[&str] = &["mp.tianstudio.top", "mp.ratzen.top"];
+        let addr = self
+            .temp_mp_address
+            .as_ref()
+            .unwrap_or(&get_data().config.mp_address);
+        // 去掉 scheme（如 tcp:// 等）
+        let addr = addr.rsplit_once("://").map(|(_, host)| host).unwrap_or(addr);
+        // 若包含端口（最后一个 ':'），取 ':' 之前作为主机名
+        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+        let host = host.trim().trim_matches(|c| c == '[' || c == ']');
+        ALLOWED.contains(&host)
+    }
+
+    /// 判断当前连接的服务器是否为可上报真实成绩的服务器（域名包含 mp.tianstudio.top / mp.ratzen.top）。
+    fn server_is_tianstudio(&self) -> bool {
+        let addr = self
+            .temp_mp_address
+            .as_ref()
+            .unwrap_or(&get_data().config.mp_address);
+        addr.contains("mp.tianstudio.top") || addr.contains("mp.ratzen.top")
+    }
+
+    /// 从谱面库中选择本地谱面（无在线 id）进行分享。
+    /// 生成随机 UUID，把本地谱面目录复制到 `download/{uuid}`，并发送 `SelectLocalChart`。
+    pub fn select_local_chart(&mut self, local_path: String, name: String) {
+        // 仅允许在指定服务器上上传本地谱面
+        if !self.server_allows_local_chart() {
+            show_message(mtl!("local-chart-server-not-allowed")).error();
+            return;
+        }
+        let client = self.clone_client();
+        if !client.blocking_is_host().unwrap() {
+            show_message(mtl!("select-chart-host-only")).error();
+            return;
+        }
         if !matches!(client.blocking_room_state(), Some(RoomState::SelectChart(_))) {
             show_message(mtl!("select-chart-not-now")).error();
             return;
         }
+        // 先清理上一次选择留下的临时副本，避免反复选择累积 download/{uuid}
+        self.cleanup_staged_local_chart();
+        // 立即生成并记录 UUID：即使后续 stage/select 失败，这个临时副本也仍能被清理
+        let uuid = uuid::Uuid::new_v4().to_string();
+        self.staged_chart_id = Some(uuid.clone());
         self.task = Some(Task::new(async move {
-            client.select_chart(id).await.with_context(|| mtl!("select-chart-failed"))?;
+            // 把本地谱面包复制到 download/{uuid}（供 serve / download 使用）
+            crate::mp::serve::stage_local_chart(&local_path, &uuid)?;
+            client.select_local_chart(uuid, name).await.with_context(|| mtl!("select-chart-failed"))?;
             Ok(())
         }));
     }
 
     fn request_start(&mut self) {
-        if matches!(self.client.as_ref().unwrap().blocking_room_state().unwrap(), RoomState::SelectChart(None)) {
+        let client = self.clone_client();
+        let state = client.blocking_room_state().unwrap();
+        // LocalChart 状态下房主已选择本地谱面：直接请求开始（服务端会通知房主启动下载服务器）
+        if matches!(state, RoomState::LocalChart) {
+            // 此处不置位 host_started：需等服务端确认（收到 StartServing）后再切换到"取消准备"，
+            // 否则请求被拒绝/超时会让房主 UI 卡住而无法重试。
+            self.task = Some(Task::new(async move {
+                client.request_start().await.with_context(|| mtl!("request-start-failed"))?;
+                Ok(())
+            }));
+            return;
+        }
+        if matches!(state, RoomState::SelectChart(None)) {
             show_message(mtl!("request-start-no-chart")).error();
             return;
         }
@@ -387,6 +504,56 @@ impl MPPanel {
                             }
                         }
                         if self.leave_room_btn.touch(touch, t) {
+                            // 离开房间：清理可能残留的本地谱面分享状态与会话临时副本
+                            self.cleanup_staged_local_chart();
+                            self.stop_serving();
+                            let client = self.clone_client();
+                            self.task = Some(Task::new(async move { client.leave_room().await }));
+                            return true;
+                        }
+                    }
+                    // 本地谱面分享状态：房主点开始（分享）、锁定、循环；玩家点"准备"后开始下载
+                    RoomState::LocalChart => {
+                        if is_host {
+                            if self.host_started {
+                                // 房主已点开始：按钮变为"取消准备"，点击取消分享
+                                if self.cancel_ready_btn.touch(touch, t) {
+                                    self.cancel_local_chart();
+                                    return true;
+                                }
+                            } else if self.request_start_btn.touch(touch, t) {
+                                self.request_start();
+                                return true;
+                            }
+                            if self.lock_room_btn.touch(touch, t) {
+                                let to = !state.locked;
+                                let client = self.clone_client();
+                                self.task = Some(Task::new(async move { client.lock_room(to).await.with_context(|| mtl!("lock-room-failed")) }));
+                                return true;
+                            }
+                            if self.cycle_room_btn.touch(touch, t) {
+                                let to = !state.cycle;
+                                let client = self.clone_client();
+                                self.task = Some(Task::new(async move { client.cycle_room(to).await.with_context(|| mtl!("cycle-room-failed")) }));
+                                return true;
+                            }
+                        } else {
+                            // 玩家：点"准备"后开始下载；已准备则按钮变为"取消准备"
+                            if self.local_ready {
+                                if self.cancel_ready_btn.touch(touch, t) {
+                                    self.cancel_local_download();
+                                    return true;
+                                }
+                            } else if self.syncing.is_none() && self.ready_btn.touch(touch, t) {
+                                self.local_ready = true;
+                                self.start_pending_download();
+                                return true;
+                            }
+                        }
+                        if self.leave_room_btn.touch(touch, t) {
+                            // 离开房间：清理本地谱面分享状态与会话临时副本
+                            self.cleanup_staged_local_chart();
+                            self.stop_serving();
                             let client = self.clone_client();
                             self.task = Some(Task::new(async move { client.leave_room().await }));
                             return true;
@@ -420,6 +587,13 @@ impl MPPanel {
                     return true;
                 }
                 if self.disconnect_btn.touch(touch, t) {
+                    // 断开连接：清理本地谱面分享状态与会话临时副本
+                    self.host_started = false;
+                    self.local_ready = false;
+                    self.pending_download = None;
+                    self.syncing = None;
+                    self.cleanup_staged_local_chart();
+                    self.stop_serving();
                     self.client = None;
                     self.msgs.clear();
                     self.msgs_dirty_from = 0;
@@ -427,9 +601,15 @@ impl MPPanel {
                 }
             }
             if client.ping_fail_count() >= 2 && self.connect_task.is_none() {
-                warn!("lost connection, reconnecting…");
-                show_message(mtl!("reconnect")).warn();
-                self.connect();
+                // 本地谱面传输期间（上传/下载）心跳可能因大帧传输短暂超时，
+                // 此时不要自动重连，避免中断正在进行的谱面传输。
+                if self.host_sharing || self.syncing.is_some() {
+                    // 仍在传输本地谱面，跳过自动重连
+                } else {
+                    warn!("lost connection, reconnecting…");
+                    show_message(mtl!("reconnect")).warn();
+                    self.connect();
+                }
             }
         }
         true
@@ -459,7 +639,7 @@ impl MPPanel {
                     msg => {
                         let content = match msg {
                             M::Chat { .. } => unreachable!(),
-                            M::CreateRoom { user } => {
+                            M::CreateRoom { user, .. } => {
                                 mtl!("msg-create-room", "user" => client.user_name(user))
                             }
                             M::JoinRoom { name, .. } => {
@@ -494,6 +674,15 @@ impl MPPanel {
                             M::Abort { user } => mtl!("msg-abort", "user" => client.user_name(user)),
                             M::LockRoom { lock } => mtl!("msg-room-lock", "lock" => lock.to_string()),
                             M::CycleRoom { cycle } => mtl!("msg-room-cycle", "cycle" => cycle.to_string()),
+                            M::SelectLocalChart { user, name, id } => {
+                                mtl!("msg-select-local-chart", "user" => client.user_name(user), "chart" => name, "id" => id)
+                            }
+                            M::SendChart { user } => {
+                                mtl!("msg-send-chart", "user" => client.user_name(user))
+                            }
+                            M::DownloadReady { user } => {
+                                mtl!("msg-download-ready", "user" => client.user_name(user))
+                            }
                         };
                         Message {
                             content,
@@ -508,20 +697,37 @@ impl MPPanel {
             if matches!(state, Some(RoomState::Playing)) {
                 if !self.game_start_consumed {
                     self.game_start_consumed = true;
-                    let id = self.chart_id.unwrap();
                     RECORD_ID.store(-1, Ordering::Relaxed);
+                    mp_reset_result();
                     self.need_upload = true;
                     self.entered = false;
-                    self.scene_task = SongScene::global_launch(
-                        Some(id),
-                        &format!("download/{id}"),
-                        Mods::default(),
-                        GameMode::NoRetry,
-                        self.client.as_ref().map(Arc::clone),
-                        None,
-                        None,
-                        false,
-                    )?;
+                    // 本地谱面分享：从本地 download/{uuid} 加载（无在线 id）
+                    if let Some((uuid, _)) = self.local_chart.clone() {
+                        self.scene_task = SongScene::global_launch(
+                            None,
+                            &format!("download/{uuid}"),
+                            Mods::default(),
+                            GameMode::NoRetry,
+                            self.client.as_ref().map(Arc::clone),
+                            None,
+                            None,
+                            false,
+                            false,
+                        )?;
+                    } else {
+                        let id = self.chart_id.unwrap();
+                        self.scene_task = SongScene::global_launch(
+                            Some(id),
+                            &format!("download/{id}"),
+                            Mods::default(),
+                            GameMode::NoRetry,
+                            self.client.as_ref().map(Arc::clone),
+                            None,
+                            None,
+                            false,
+                            false,
+                        )?;
+                    }
                 }
             } else {
                 self.game_start_consumed = false;
@@ -529,7 +735,25 @@ impl MPPanel {
             if let Some(RoomState::SelectChart(chart)) = state {
                 self.chart_id = chart;
             }
+            if matches!(state, Some(RoomState::LocalChart)) {
+                // 本地谱面分享状态；本地谱面 id 为 UUID，用于 download/{uuid} 加载
+                if self.local_chart.is_some() {
+                    self.chart_id = None; // 本地谱面无在线 id，置空在线 chart_id
+                }
+            } else {
+                // 离开本地谱面分享阶段（进入游玩/选谱等）：重置本地谱面相关状态，
+                // 避免本地谱面游玩结束后残留状态导致切换到在线谱面时卡在转圈/无法开始。
+                self.host_started = false;
+                self.local_ready = false;
+                self.local_download_cancel = None;
+                self.local_chart = None;
+                self.pending_download = None;
+                self.syncing = None;
+                self.stop_serving();
+            }
         }
+        // 处理服务端下发的 LocalChart 本地谱面同步事件
+        self.update_local_chart();
         if let Some(task) = &mut self.connect_task {
             if let Some(res) = task.take() {
                 match res {
@@ -588,7 +812,7 @@ impl MPPanel {
                                 } else {
                                     None
                                 }
-                            })?);
+                            }, false)?);
                         } else {
                             self.post_download();
                         }
@@ -643,7 +867,7 @@ impl MPPanel {
                         };
                     }
                 }
-                self.task = None;
+                self.join_room_task = None;
             }
         }
         if let Some((id, text)) = take_input() {
@@ -681,16 +905,270 @@ impl MPPanel {
         }
         if self.need_upload && self.entered {
             let id = RECORD_ID.load(Ordering::Relaxed);
-            if id != -1 {
+            // 取本局真实成绩（本地/在线谱面均可），用于游戏结束的成绩展示
+            let result = mp_take_result();
+            // 仅当连接的服务器包含 mp.tianstudio.top 时才上传真实成绩，
+            // 其它服务器保持默认行为（放弃游戏）。
+            let upload_score = self.server_is_tianstudio();
+            // 单人房间中游玩期间一旦连接断连/重连，服务端可能已在 Playing 状态清理掉房间
+            // （on_user_leave -> user.room = None），此时再上报成绩会得到 "no room" 报错。
+            // 因此若已不在房间，则跳过成绩上报。
+            let in_room = self
+                .client
+                .as_ref()
+                .is_some_and(|it| it.blocking_state().is_some());
+            if in_room {
                 let client = self.clone_client();
-                self.task = Some(Task::new(async move { client.played(id).await }));
-            } else {
-                let client = self.clone_client();
-                self.task = Some(Task::new(async move { client.abort().await }));
+                self.task = Some(Task::new(async move {
+                    if upload_score {
+                        if let Some(r) = result {
+                            client
+                                .played(id, r.score, r.accuracy, r.full_combo, r.max_combo, r.perfect, r.good, r.bad, r.miss)
+                                .await
+                        } else {
+                            client.abort().await
+                        }
+                    } else {
+                        client.abort().await
+                    }
+                }));
             }
             self.need_upload = false;
         }
+        // 本地谱面同步任务完成：成功则隐藏"正在同步谱面"转圈
+        if let Some(task) = &mut self.local_chart_task {
+            if let Some(res) = task.take() {
+                match res {
+                    Ok(()) => {
+                        // 房主：上传完成即停止下载服务器并隐藏转圈
+                        // 玩家：下载完成即隐藏转圈（玩家已在 task 内通知服务端就绪）
+                        if self.host_sharing {
+                            self.stop_serving();
+                        }
+                        self.syncing = None;
+                    }
+                    Err(err) => {
+                        // 上传/下载失败：隐藏"正在同步谱面"转圈，并重置按钮状态，方便用户重试
+                        if self.host_sharing {
+                            self.stop_serving();
+                        }
+                        if let Some(syncing) = &self.syncing {
+                            syncing.set_error(err.to_string());
+                        }
+                        self.syncing = None;
+                        self.host_started = false;
+                        self.local_ready = false;
+                        self.local_download_cancel = None;
+                        show_error(err);
+                    }
+                }
+                self.local_chart_task = None;
+            }
+        }
+        if let Some(syncing) = &self.syncing {
+            if let Some(err) = syncing.error() {
+                self.syncing = None;
+                show_message(mtl!("local-chart-sync-failed", "err" => err)).error();
+            }
+        }
         Ok(())
+    }
+
+    /// 消费服务端下发的 LocalChart 事件，驱动本地谱面分享流程。
+    fn update_local_chart(&mut self) {
+        let Some(client) = self.client.clone() else { return };
+        let is_host = client.blocking_is_host().unwrap_or(false);
+        let events = client.blocking_take_local_chart_events();
+        for ev in events {
+            match ev {
+                phira_mp_client::LocalChartEvent::ChangeLocalChart { local, chart_id } => {
+                    if local {
+                        self.staged_chart_id = Some(chart_id.clone());
+                        self.local_chart = Some((chart_id, String::new()));
+                    } else {
+                        // 退出本地谱面分享（游玩结束 / 房主改选在线谱面）：清理本次会话生成的
+                        // download/{uuid} 临时副本，避免其永久残留在 download/ 下。
+                        self.cleanup_staged_local_chart();
+                        self.pending_download = None;
+                        self.syncing = None;
+                        self.stop_serving();
+                    }
+                    // 重置就绪/开始按钮状态
+                    self.host_started = false;
+                    self.local_ready = false;
+                    self.local_download_cancel = None;
+                }
+                phira_mp_client::LocalChartEvent::StartServing { chart_id, chart_name } => {
+                    if !is_host {
+                        continue;
+                    }
+                    self.staged_chart_id = Some(chart_id.clone());
+                    self.local_chart = Some((chart_id.clone(), chart_name));
+                    // 服务端已确认开始分享：此时才切换到"取消准备"状态
+                    self.host_started = true;
+                    self.start_serving(chart_id);
+                }
+                phira_mp_client::LocalChartEvent::StartDownload {
+                    host_id: _,
+                    host_name: _,
+                    addr,
+                    port,
+                    chart_id,
+                    chart_name,
+                } => {
+                    if is_host {
+                        continue;
+                    }
+                    // 玩家：建立连接后不立即下载，先保存下载信息，等点击"准备"后才开始下载
+                    self.staged_chart_id = Some(chart_id.clone());
+                    self.local_chart = Some((chart_id.clone(), chart_name.clone()));
+                    self.pending_download = Some((addr, port, chart_id, chart_name));
+                }
+                phira_mp_client::LocalChartEvent::HostReady => {
+                    if is_host {
+                        self.stop_serving();
+                    }
+                    self.host_started = false;
+                    self.local_ready = false;
+                    self.local_download_cancel = None;
+                }
+                phira_mp_client::LocalChartEvent::Canceled => {
+                    // 房主取消了分享：清理会话临时副本，并重置所有就绪/开始按钮状态
+                    self.cleanup_staged_local_chart();
+                    self.host_started = false;
+                    self.local_ready = false;
+                    self.pending_download = None;
+                    self.syncing = None;
+                    self.local_download_cancel = None;
+                    self.stop_serving();
+                }
+            }
+        }
+    }
+
+    fn start_serving(&mut self, chart_id: String) {
+        // 实际传输走 game 连接（服务端中转），本地 HTTP 监听器只是兜底，
+        // 因此监听失败不应阻断分享，仅记录日志。
+        match crate::mp::serve::ChartServer::start(chart_id.clone()) {
+            Ok(server) => self.serving = Some(Arc::clone(&server)),
+            Err(err) => warn!(?err, "failed to start local chart http server (ignored)"),
+        }
+        self.host_sharing = true;
+        // 上传任务取消标记：取消分享/停止服务后置位，任务会在 send_chart 前检查
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.host_upload_cancel = Some(Arc::clone(&cancel));
+        let client = self.clone_client();
+        let server = self.serving.clone();
+        self.local_chart_task = Some(Task::new(async move {
+            // 短暂等待监听就绪（监听器启动失败则跳过）
+            if let Some(server) = &server {
+                for _ in 0..50 {
+                    if server.ready() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            }
+            // 已取消则不再上传，避免在服务端缓存中留下无用的谱面包
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            // 把本地谱面包经 game 连接上传到服务端（服务端打洞中转），玩家从服务端下载
+            crate::mp::serve::upload_chart(&client, &chart_id).await?;
+            // 上传期间若分享已被取消，则不再通知服务端开始分享，避免"取消后又被重启"
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok::<_, anyhow::Error>(());
+            }
+            // 通知服务端开始分享；玩家下载地址由服务端下发（服务端公网IP + web端口）
+            client.send_chart(String::new(), 0).await?;
+            Ok::<_, anyhow::Error>(())
+        }));
+    }
+
+    fn stop_serving(&mut self) {
+        // 置位取消标记：若上传任务仍在进行，使其完成后不再发送 send_chart
+        if let Some(cancel) = self.host_upload_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.host_sharing = false;
+        if let Some(server) = self.serving.take() {
+            server.stop();
+        }
+    }
+
+    /// 结束本地谱面分享：清空当前分享状态，并删除本次会话生成的临时副本
+    /// （`download/{uuid}`）及其本地成绩记录。
+    /// 该目录名不是数字 id，不会被谱面扫描器收录；若不清理，每次分享都会永久留下一份完整副本。
+    fn cleanup_staged_local_chart(&mut self) {
+        self.local_chart = None;
+        let Some(id) = self.staged_chart_id.take() else { return };
+        crate::mp::serve::remove_staged_chart(&id);
+        get_data_mut().local_records.remove(&format!("download/{id}"));
+    }
+
+    /// 玩家点击"准备"后开始经服务端下载谱面；下载完成后发送就绪指令。
+    /// 若没有待下载信息（异常情况），直接发送就绪。
+    fn start_pending_download(&mut self) {
+        let Some((_addr, _port, chart_id, _chart_name)) = self.pending_download.take() else {
+            // 没有待下载信息：直接通知服务端就绪
+            let client = self.clone_client();
+            self.local_chart_task = Some(Task::new(async move {
+                client.download_ready().await?;
+                Ok::<_, anyhow::Error>(())
+            }));
+            return;
+        };
+        // 显示"正在同步谱面"转圈并经 game 连接从服务端下载
+        let syncing = Arc::new(crate::mp::serve::ChartSyncing::new());
+        syncing.mark_started();
+        self.syncing = Some(Arc::clone(&syncing));
+        let client = self.clone_client();
+        // 取消标志：玩家取消准备后，下载完成不再自动发送就绪
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel_task = Arc::clone(&cancel);
+        self.local_download_cancel = Some(cancel);
+        self.local_chart_task = Some(Task::new(async move {
+            crate::mp::serve::download_chart(&client, &chart_id, Arc::clone(&syncing)).await?;
+            if !cancel_task.load(std::sync::atomic::Ordering::Relaxed) {
+                client.download_ready().await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }));
+    }
+
+    /// 房主取消本地谱面分享：删除服务端缓存、重置所有玩家就绪状态
+    fn cancel_local_chart(&mut self) {
+        self.host_started = false;
+        self.local_ready = false;
+        self.pending_download = None;
+        self.syncing = None;
+        if let Some(cancel) = self.local_download_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // 丢弃上传任务句柄（任务本体可能仍在执行，但已被取消标记失效），
+        // 让 UI 立刻可重新操作；同时清理会话生成的临时副本。
+        self.local_chart_task = None;
+        self.cleanup_staged_local_chart();
+        self.stop_serving();
+        let client = self.clone_client();
+        self.task = Some(Task::new(async move {
+            client.cancel_local_chart().await?;
+            Ok(())
+        }));
+    }
+
+    /// 玩家取消已就绪（尚未开始游玩前可取消）
+    fn cancel_local_download(&mut self) {
+        self.local_ready = false;
+        self.syncing = None;
+        if let Some(cancel) = self.local_download_cancel.take() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let client = self.clone_client();
+        self.task = Some(Task::new(async move {
+            client.cancel_download_ready().await?;
+            Ok(())
+        }));
     }
 
     pub fn render(&mut self, tm: &mut TimeManager, ui: &mut Ui) {
@@ -731,7 +1209,10 @@ impl MPPanel {
         if let Some(dl) = &mut self.downloading {
             dl.render(ui, t);
         }
-        if self.has_task() {
+        // 本地谱面同步：房主分享中 / 玩家下载中 -> 显示"正在同步谱面"加载转圈
+        if self.host_sharing || self.syncing.is_some() {
+            ui.full_loading(mtl!("local-chart-syncing"), t);
+        } else if self.has_task() {
             ui.full_loading_simple(t);
         }
     }
@@ -799,6 +1280,25 @@ impl MPPanel {
                         btns.push((&mut self.request_start_btn, mtl!("request-start").into_owned()));
                         btns.push((&mut self.lock_room_btn, mtl!("lock-room", "current" => state.locked.to_string())));
                         btns.push((&mut self.cycle_room_btn, mtl!("cycle-room", "current" => state.cycle.to_string())));
+                    }
+                    btns.push((&mut self.leave_room_btn, mtl!("leave-room").into_owned()));
+                }
+                RoomState::LocalChart => {
+                    if client.blocking_is_host().unwrap() {
+                        if self.host_started {
+                            // 房主已点开始：开始按钮变为"取消准备"
+                            btns.push((&mut self.cancel_ready_btn, mtl!("cancel-ready").into_owned()));
+                        } else {
+                            btns.push((&mut self.request_start_btn, mtl!("request-start").into_owned()));
+                        }
+                        btns.push((&mut self.lock_room_btn, mtl!("lock-room", "current" => state.locked.to_string())));
+                        btns.push((&mut self.cycle_room_btn, mtl!("cycle-room", "current" => state.cycle.to_string())));
+                    } else if self.local_ready {
+                        // 玩家已准备：按钮变为"取消准备"，直到进入游玩才隐藏
+                        btns.push((&mut self.cancel_ready_btn, mtl!("cancel-ready").into_owned()));
+                    } else if self.pending_download.is_some() {
+                        // 玩家：房主上传完成后，等待点击"准备"开始下载
+                        btns.push((&mut self.ready_btn, mtl!("ready").into_owned()));
                     }
                     btns.push((&mut self.leave_room_btn, mtl!("leave-room").into_owned()));
                 }

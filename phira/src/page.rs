@@ -16,6 +16,9 @@ pub use library::{request_export, resolve_export, take_export, ExportInfo, Libra
 mod message;
 pub use message::MessagePage;
 
+mod mp_servers;
+pub use mp_servers::MpServerPage;
+
 mod offset;
 pub use offset::OffsetPage;
 
@@ -24,6 +27,9 @@ pub use respack::{ResPackItem, ResPackPage};
 
 mod settings;
 pub use settings::SettingsPage;
+
+mod replay_list;
+pub use replay_list::ReplayListPage;
 use tokio::sync::Notify;
 
 use crate::{

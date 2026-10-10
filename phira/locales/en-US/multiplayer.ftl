@@ -3,6 +3,7 @@ multiplayer = Multiplayer
 
 connect = Connect
 connect-must-login = You must login to access multiplayer functionality.
+connect-no-server = Add and select a multiplayer server first.
 connect-success = Connected successfully.
 connect-failed = Failed to connect.
 connect-authenticate-failed = Authorization failed.
@@ -84,3 +85,13 @@ msg-room-cycle = { $cycle ->
   [true] Room mode changed to Cycle.
   *[other] Room mode changed to Normal.
 }
+
+# LocalChart local chart sharing
+local-chart-syncing = Syncing chart…
+local-chart-sync-failed = Chart sync failed: { $err }
+select-local-chart = Select local chart
+select-local-chart-prompt = Enter local chart ID and name (space separated)
+local-chart-server-not-allowed = This server does not allow uploading local charts
+msg-select-local-chart = The host `{ $user }` selected local chart `{ $chart }` (#{ $id }).
+msg-send-chart = The host `{ $user }` is sharing a chart.
+msg-download-ready = `{ $user }` finished syncing the chart.

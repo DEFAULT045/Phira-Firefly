@@ -1,11 +1,12 @@
-prpr_l10n::tl_file!("library");
+﻿prpr_l10n::tl_file!("library");
 
-use super::{CollectionPage, FavoritesPage, NextPage, Page, SharedState};
+use super::{FavoritesPage, NextPage, Page, SharedState};
 use crate::{
     charts_view::{ChartDisplayItem, ChartsView, NEED_UPDATE},
     client::{recv_raw, Chart, ChartRef, ChartRefChartInfo, Client, Collection, CollectionUpdate, LocalCollection},
     dir, get_data, get_data_mut,
     icons::Icons,
+    login::Login,
     page::{favorites::FAV_PAGE_RESULT, ChartItem, ChartType, Illustration},
     popup::Popup,
     rate::RateDialog,
@@ -21,8 +22,8 @@ use inputbox::InputBox;
 use jni::{jni_sig, jni_str, objects::JObject, refs::Global, vm::JavaVM, EnvUnowned};
 use macroquad::prelude::*;
 use prpr::{
-    ext::{poll_future, semi_black, JoinToString, LocalTask, RectExt, SafeTexture, ScaleType},
-    scene::{request_file, request_input, return_input, show_error, show_message, take_input, NextScene},
+    ext::{poll_future, semi_black, semi_white, JoinToString, LocalTask, RectExt, SafeTexture, ScaleType},
+    scene::{request_file, request_input, request_input_inline, return_input, show_error, show_message, take_input, NextScene},
     task::Task,
     ui::{button_hit, DRectButton, Dialog, RectButton, Ui},
 };
@@ -61,6 +62,7 @@ enum ChartListType {
     Special,
     Unstable,
     Popular,
+    XcSim,
 }
 
 struct ChartList {
@@ -71,6 +73,11 @@ impl ChartList {
     fn new(ty: ChartListType, icons: Arc<Icons>, rank_icons: [SafeTexture; 8]) -> Self {
         let mut view = ChartsView::new(icons, rank_icons);
         view.can_refresh = ty != ChartListType::Local;
+        view.require_xcsim_login = ty == ChartListType::XcSim;
+        #[cfg(feature = "testing")]
+        {
+            view.lan_manager = Some(Arc::new(Mutex::new(crate::lan::LanManager::new())));
+        }
         Self { ty, view }
     }
 }
@@ -91,6 +98,9 @@ type OnlineTask = Task<Result<OnlineTaskResult>>;
 
 pub struct LibraryPage {
     tabs: Tabs<ChartList>,
+
+    tr1: [Rect; 6],
+    nb1: [DRectButton; 6],
 
     current_page: u64,
     online_total_page: u64,
@@ -160,6 +170,10 @@ pub struct LibraryPage {
     export_task: Option<mpsc::Receiver<Result<()>>>,
     export_progress: Arc<AtomicU32>,
     export_total: usize,
+
+    login_btn: DRectButton,
+    login: Login,
+    xcsim_logout: Arc<AtomicBool>,
 }
 
 impl LibraryPage {
@@ -174,7 +188,11 @@ impl LibraryPage {
                 (new_list(ChartListType::Special), || ttl!("chart-special")),
                 (new_list(ChartListType::Unstable), || ttl!("chart-unstable")),
                 (new_list(ChartListType::Popular), || tl!("popular")),
-            ] as [(ChartList, TitleFn); 5]),
+                (new_list(ChartListType::XcSim), || tl!("xcsim")),
+            ] as [(ChartList, TitleFn); 6]),
+
+            tr1: [Rect::new(0., 0., 0., 0.); 6],
+            nb1: [(); 6].map(|_| DRectButton::new()),
 
             current_page: 0,
             online_total_page: 0,
@@ -246,6 +264,10 @@ impl LibraryPage {
             export_task: None,
             export_progress: Arc::default(),
             export_total: 0,
+
+            login_btn: DRectButton::new(),
+            login: Login::new_xcsim(),
+            xcsim_logout: Arc::default(),
         })
     }
 }
@@ -264,12 +286,16 @@ impl LibraryPage {
             show_message(tl!("offline-mode")).error();
             return;
         }
-        if get_data().me.is_none() {
-            show_error(anyhow!(tl!("must-login")));
-            return;
-        }
-        if !check_read_tos_and_policy(false, false) {
-            return;
+        let chosen = self.tabs.selected().ty;
+        // XC-SIM has its own account system and does not require a Phira login to browse.
+        if chosen != ChartListType::XcSim {
+            if get_data().me.is_none() {
+                show_error(anyhow!(tl!("must-login")));
+                return;
+            }
+            if !check_read_tos_and_policy(false, false) {
+                return;
+            }
         }
         self.tabs.selected_mut().view.reset_scroll();
         self.tabs.selected_mut().view.clear();
@@ -288,6 +314,18 @@ impl LibraryPage {
                 order.to_owned()
             }
         };
+        let division = self.tags.division;
+        if chosen == ChartListType::XcSim {
+            self.online_task = Some(Task::new(async move {
+                // type=-1：拉取全部已审核谱面（stable + unstable），pageNum 与官方列表一致，
+                // 避免服务器默认 20/页与 PAGE_NUM 计算总页数不一致导致翻页丢失。
+                let (remote_charts, count) = crate::client::xcsim::query_charts(&search, &order, &division, -1, page, PAGE_NUM).await?;
+                let total_page = if count == 0 { 0 } else { (count - 1) / PAGE_NUM + 1 };
+                let charts: Vec<_> = remote_charts.iter().map(ChartDisplayItem::from_remote).collect();
+                Ok((charts, remote_charts, total_page))
+            }));
+            return;
+        }
         let tags = self
             .tags
             .tags
@@ -296,9 +334,7 @@ impl LibraryPage {
             .cloned()
             .chain(self.tags.unwanted.as_ref().unwrap().tags().iter().map(|it| format!("-{it}")))
             .join(",");
-        let division = self.tags.division;
         let rating_range = format!("{},{}", self.rating.rate.score as f32 / 10., self.rating.rate_upper.as_ref().unwrap().score as f32 / 10.);
-        let chosen = self.tabs.selected().ty;
         let popular = chosen == ChartListType::Popular;
         let typ = match chosen {
             ChartListType::Ranked => 0,
@@ -395,7 +431,6 @@ impl LibraryPage {
                     }
                 }))
             } else {
-                charts.push(ChartDisplayItem::new(None, None));
                 charts.extend(
                     charts_local
                         .iter()
@@ -671,6 +706,9 @@ impl Page for LibraryPage {
 
     fn touch(&mut self, touch: &Touch, s: &mut SharedState) -> Result<bool> {
         let t = s.t;
+        if self.login.touch(touch, t) {
+            return Ok(true);
+        }
         if self.sync_fav_task.is_some()
             || self.export_task.is_some()
             || self.multi_create_fav_task.is_some()
@@ -709,6 +747,17 @@ impl Page for LibraryPage {
                 return Ok(true);
             }
         }
+        if prpr::ui::PREFER_ALT_UI.load(std::sync::atomic::Ordering::Relaxed) {
+            for (i, nr) in self.tr1.iter().enumerate() {
+                if nr.w > 0. && nr.contains(touch.position) {
+                    self.tabs.goto(s.t, i);
+                    return Ok(true);
+                }
+            }
+        }
+        if self.tabs.touch(touch, s.rt) {
+            return Ok(true);
+        }
         let charts_view = &mut self.tabs.selected_mut().view;
         if charts_view.transiting() {
             return Ok(true);
@@ -717,9 +766,6 @@ impl Page for LibraryPage {
             return Ok(true);
         }
         if choose_cover {
-            return Ok(true);
-        }
-        if self.tabs.touch(touch, s.rt) {
             return Ok(true);
         }
         if !matches!(self.tabs.selected().ty, ChartListType::Local) {
@@ -763,11 +809,11 @@ impl Page for LibraryPage {
                     return Ok(true);
                 }
                 if !self.search_clr_btn.contains(touch.position) && self.search_btn.touch(touch, t) {
-                    request_input("search", InputBox::new().default_text(&self.search_str));
+                    request_input_inline("search", InputBox::new().default_text(&self.search_str));
                     return Ok(true);
                 }
             }
-            ChartListType::Ranked | ChartListType::Special | ChartListType::Unstable => {
+            ChartListType::Ranked | ChartListType::Special | ChartListType::Unstable | ChartListType::XcSim => {
                 if !self.search_str.is_empty() && self.search_clr_btn.touch(touch) {
                     button_hit();
                     self.search_str.clear();
@@ -776,7 +822,7 @@ impl Page for LibraryPage {
                     return Ok(true);
                 }
                 if !self.search_clr_btn.contains(touch.position) && self.search_btn.touch(touch, t) {
-                    request_input("search", InputBox::new().default_text(&self.search_str));
+                    request_input_inline("search", InputBox::new().default_text(&self.search_str));
                     return Ok(true);
                 }
                 if self.filter_btn.touch(touch, t) {
@@ -815,6 +861,14 @@ impl Page for LibraryPage {
             self.need_show_order_meta_menu = true;
             return Ok(true);
         }
+        if self.tabs.selected().ty == ChartListType::XcSim && self.login_btn.touch(touch, t) {
+            if crate::client::xcsim::is_logged_in() {
+                confirm_dialog(tl!("xcsim-logout"), tl!("xcsim-logout-confirm"), self.xcsim_logout.clone());
+            } else {
+                self.login.enter(t);
+            }
+            return Ok(true);
+        }
         Ok(false)
     }
 
@@ -840,6 +894,11 @@ impl Page for LibraryPage {
 
         self.tags.update(t);
         self.rating.update(t);
+        self.login.update(t)?;
+        if self.xcsim_logout.swap(false, Ordering::SeqCst) {
+            crate::client::xcsim::logout();
+            show_message(tl!("xcsim-logged-out")).ok();
+        }
 
         let is_local = self.tabs.selected().ty == ChartListType::Local;
         if self.tabs.changed() {
@@ -852,11 +911,6 @@ impl Page for LibraryPage {
                 self.current_page = 0;
                 self.load_online();
             }
-        }
-        if self.tabs.selected_mut().view.clicked_special {
-            let icons = Arc::clone(&self.icons);
-            self.next_page_task = Some(Box::pin(async move { Ok(NextPage::Overlay(Box::new(CollectionPage::new(icons).await?))) }));
-            self.tabs.selected_mut().view.clicked_special = false;
         }
         if let Some(task) = &mut self.next_page_task {
             if let Some(res) = poll_future(task.as_mut()) {
@@ -1381,8 +1435,13 @@ impl Page for LibraryPage {
     fn render(&mut self, ui: &mut Ui, s: &mut SharedState) -> Result<()> {
         self.check_fav_page(s);
 
+        if prpr::ui::PREFER_ALT_UI.load(std::sync::atomic::Ordering::Relaxed) {
+            return self.render_a1(ui, s);
+        }
+
         let t = s.t;
         let rt = s.rt;
+
         let mut r = ui.content_rect();
         let chosen = self.tabs.selected().ty;
         if chosen != ChartListType::Local {
@@ -1503,6 +1562,20 @@ impl Page for LibraryPage {
                     self.order_meta_menu.show(ui, t, Rect::new(r.x, r.bottom() + 0.02, 0.35, 0.2));
                 }
 
+                // XC-SIM 分区登录按钮：未登录显示「登录」，登录后显示玩家名，宽度随文字自适应。
+                if chosen == ChartListType::XcSim {
+                    let xcsim_logged_in = crate::client::xcsim::is_logged_in();
+                    let label: String = if xcsim_logged_in {
+                        get_data().xcsim_name.clone().unwrap_or_else(|| tl!("xcsim-login").into_owned())
+                    } else {
+                        tl!("xcsim-login").into_owned()
+                    };
+                    let tw = ui.text(&label).size(0.5).measure().w;
+                    r.w = tw + 0.16;
+                    r.x -= r.w + 0.02;
+                    self.login_btn.render_text(ui, r, t, &label, 0.5, xcsim_logged_in);
+                }
+
                 let empty = self.search_str.is_empty();
                 r.w = 0.53;
                 r.x -= r.w + 0.02;
@@ -1586,6 +1659,7 @@ impl Page for LibraryPage {
         self.manage_fav_menu.render(ui, t, 1.);
         self.tags.render(ui, t);
         self.rating.render(ui, t);
+        self.login.render(ui, t);
         Ok(())
     }
 
@@ -1617,4 +1691,168 @@ impl Page for LibraryPage {
     fn next_scene(&mut self, _s: &mut SharedState) -> NextScene {
         self.tabs.selected_mut().view.next_scene().unwrap_or_default()
     }
+}
+
+impl LibraryPage {
+    pub fn render_a1(&mut self, ui: &mut Ui, s: &mut SharedState) -> Result<()> {
+        let t1 = s.t;
+        let rt1 = s.rt;
+        let top = ui.top;
+        let bar_y = -top;
+        let bar_h = 0.155_f32;
+        let margin = 0.045_f32;
+        let full_x = -1.0 + margin;
+        let full_w = (1.0 - margin) - full_x;
+        let body_y = bar_y + bar_h;
+        let content_bott = top - margin;
+        let accent = Color::new(0.949, 0.412, 0.580, 1.0);
+        let accent_soft = Color::new(1.0, 0.58, 0.706, 1.0);
+        let cream = Color::new(0.984, 0.973, 0.886, 1.0);
+        let sidebar_bg = Color::new(0.15, 0.075, 0.12, 0.45);
+        let dark_bg = Color::new(0.243, 0.110, 0.176, 0.98);
+        let backdrop = Color::new(0.15, 0.075, 0.12, 0.7);
+
+        s.render_fader(ui, |ui1| {
+            let chosen2 = self.tabs.selected().ty;
+            // backdrop drawn by main scene
+            ui1.fill_rect(Rect::new(-1., bar_y, 2., bar_h), Color::new(1.0, 0.58, 0.706, 0.06));
+            for i1 in 0..8 {
+                ui1.text("\u{2661}")
+                    .pos(0.30 + i1 as f32 * 0.105, bar_y + 0.028)
+                    .anchor(0.5, 0.5).no_baseline().size(0.28)
+                    .color(Color::new(1.0, 0.776, 0.847, 0.10)).draw();
+            }
+            let br = ui1.back_rect();
+            ui1.fill_path(&br.feather(-0.004).rounded(br.h * 0.5), Color::new(1.0, 0.58, 0.706, 0.16));
+            ui1.text("\u{2190}")
+                .pos(br.center().x, br.center().y)
+                .anchor(0.5, 0.5).no_baseline().size(0.5)
+                .color(accent).draw();
+            let title_x = br.right() + 0.04;
+            let title_r = ui1.text("Library")
+                .pos(title_x, bar_y + bar_h * 0.42)
+                .anchor(0., 0.5).no_baseline().size(0.82)
+                .color(cream).draw();
+            ui1.text("\u{2665}")
+                .pos(title_r.right() + 0.028, title_r.center().y)
+                .anchor(0., 0.5).no_baseline().size(0.5)
+                .color(accent).draw();
+            ui1.fill_path(&Rect::new(title_x, bar_y + bar_h - 0.022, title_r.w.min(0.22), 0.006).rounded(0.003), accent_soft);
+
+            let btn_h = bar_h - 0.04;
+            let btn_y = bar_y + 0.02;
+            let mut bx = 0.95_f32;
+            let bw = 0.14_f32;
+            bx -= bw;
+            let r = Rect::new(bx, btn_y, bw - 0.01, btn_h);
+            self.order_btn.render_shadow(ui1, r, rt1, |ui2, path| {
+                ui2.fill_path(&path, dark_bg);
+                ui2.text("Order").pos(r.center().x, r.center().y).anchor(0.5, 0.5).no_baseline().size(0.40).color(WHITE).draw();
+            });
+            bx -= 0.01;
+            let bw1 = 0.16_f32;
+            bx -= bw1;
+            let r1 = Rect::new(bx, btn_y, bw1 - 0.01, btn_h);
+            let search_label = if self.search_str.is_empty() { "Search" } else { &self.search_str };
+            self.search_btn.render_shadow(ui1, r1, rt1, |ui3, path| {
+                ui3.fill_path(&path, if self.search_str.is_empty() { dark_bg } else { accent });
+                ui3.text(search_label).pos(r1.center().x, r1.center().y).anchor(0.5, 0.5).no_baseline().size(0.36).max_width(bw1 - 0.02).color(WHITE).draw();
+            });
+            bx -= 0.01;
+            let bw2 = 0.16_f32;
+            bx -= bw2;
+            let r2 = Rect::new(bx, btn_y, bw2 - 0.01, btn_h);
+            if chosen2 == ChartListType::Local {
+                self.import_btn.render_shadow(ui1, r2, rt1, |ui4, path| {
+                    ui4.fill_path(&path, dark_bg);
+                    ui4.text("Import").pos(r2.center().x, r2.center().y).anchor(0.5, 0.5).no_baseline().size(0.40).color(WHITE).draw();
+                });
+            } else {
+                self.filter_btn.render_shadow(ui1, r2, rt1, |ui5, path| {
+                    ui5.fill_path(&path, dark_bg);
+                    ui5.text("Filter").pos(r2.center().x, r2.center().y).anchor(0.5, 0.5).no_baseline().size(0.40).color(WHITE).draw();
+                });
+            }
+
+            let pag_h = 0.085_f32;
+            let val = if chosen2 != ChartListType::Local { pag_h + 0.024 } else { 0.0 };
+            let content_top = body_y + 0.012;
+            let content_h = content_bott - content_top - val;
+            let side_w = 0.44_f32;
+            let gap = 0.03_f32;
+            let side_rect = Rect::new(full_x, content_top, side_w, content_h);
+            ui1.fill_path(&side_rect.feather(0.01).rounded(0.04), Color::new(1.0, 0.58, 0.706, 0.16));
+            ui1.fill_path(&side_rect.rounded(0.035), Color::new(0.15, 0.075, 0.12, 0.3));
+            let sel = self.tabs.selected_idx();
+            let tb_h = 0.104_f32;
+            let tb_gap = 0.02_f32;
+            let tb_top = content_top + 0.024;
+            for i2 in 0..6 {
+                let by = tb_top + i2 as f32 * (tb_h + tb_gap);
+                let tr = Rect::new(full_x + 0.02, by, side_w - 0.04, tb_h);
+                self.tr1[i2] = tr;
+                let active = i2 == sel;
+                if active {
+                    ui1.fill_path(&tr.feather(0.006).rounded(tb_h * 0.5), Color::new(1.0, 0.58, 0.706, 0.25));
+                    ui1.fill_path(&tr.rounded(tb_h * 0.5), accent);
+                } else {
+                    ui1.fill_path(&tr.rounded(tb_h * 0.5), sidebar_bg);
+                    ui1.stroke_path(&tr.rounded(tb_h * 0.5), 0.0025, Color::new(1.0, 0.776, 0.847, 0.18));
+                }
+                let label = self.tabs.title(i2);
+                ui1.text(format!("{} {}", if active { "\u{2665}" } else { "\u{2661}" }, label))
+                    .pos(tr.x + 0.036, tr.center().y)
+                    .anchor(0., 0.5).no_baseline().size(0.44)
+                    .max_width(tr.w - 0.07)
+                    .color(if active { WHITE } else { semi_white(0.7) })
+                    .draw();
+                self.nb1[i2].render_shadow(ui1, tr, rt1, |_, _| {});
+            }
+            let panel_x = full_x + side_w + gap;
+            let panel_w = full_w - side_w - gap;
+            let content_card = Rect::new(panel_x, content_top, panel_w, content_h);
+            ui1.fill_path(&content_card.feather(0.01).rounded(0.04), Color::new(1.0, 0.58, 0.706, 0.16));
+            ui1.fill_path(&content_card.rounded(0.035), Color::new(0.15, 0.075, 0.12, 0.3));
+            let content_inne = Rect::new(panel_x + 0.016, content_top + 0.016, panel_w - 0.032, content_h - 0.032);
+
+            if chosen2 != ChartListType::Local {
+                let total_page = self.total_page();
+                let pag_w = 0.46_f32;
+                let pag_x = panel_x + panel_w * 0.5 - pag_w / 2.;
+                let pag_y = content_top + content_h + 0.012;
+                let pag_row = Rect::new(pag_x, pag_y, pag_w, pag_h);
+                ui1.fill_path(&pag_row.rounded(pag_h * 0.5), Color::new(1.0, 0.58, 0.706, 0.10));
+                let pw = 0.09_f32;
+                let prev_r = Rect::new(pag_x + 0.014, pag_y + 0.012, pw, pag_h - 0.024);
+                let next_r = Rect::new(pag_row.right() - pw - 0.014, pag_y + 0.012, pw, pag_h - 0.024);
+                self.prev_page_btn.render_shadow(ui1, prev_r, rt1, |ui6, path| {
+                    ui6.fill_path(&path, if self.current_page > 0 { accent } else { semi_black(0.4) });
+                    ui6.text("\u{25C0}").pos(prev_r.center().x, prev_r.center().y).anchor(0.5, 0.5).no_baseline().size(0.46).color(WHITE).draw();
+                });
+                ui1.text(format!("{} / {}", self.current_page + 1, total_page.max(1)))
+                    .pos(pag_row.center().x, pag_y + pag_h * 0.5)
+                    .anchor(0.5, 0.5).no_baseline().size(0.46).color(cream).draw();
+                self.next_page_btn.render_shadow(ui1, next_r, rt1, |ui7, path| {
+                    ui7.fill_path(&path, if self.current_page + 1 < total_page { accent } else { semi_black(0.4) });
+                    ui7.text("\u{25B6}").pos(next_r.center().x, next_r.center().y).anchor(0.5, 0.5).no_baseline().size(0.46).color(WHITE).draw();
+                });
+            }
+
+            let cols = ((panel_w / 0.33).round() as u32).max(2);
+            let val1 = self.tabs.selected_mut();
+            val1.view.row_num = cols;
+            ui1.scissor(content_inne, |val2| {
+                val1.view.render(val2, content_inne, t1);
+            });
+            self.tags.render(ui1, rt1);
+            self.rating.render(ui1, rt1);
+            self.order_menu.render(ui1, t1, 1.);
+            self.order_meta_menu.render(ui1, t1, 1.);
+            self.multi_operation_menu.render(ui1, t1, 1.);
+            self.multi_select_menu.render(ui1, t1, 1.);
+            Ok::<(), anyhow::Error>(())
+        })?;
+        Ok(())
+    }
+
 }

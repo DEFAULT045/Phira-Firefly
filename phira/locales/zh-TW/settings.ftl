@@ -4,6 +4,7 @@ audio = 音訊
 chart = 譜面
 debug = 除錯
 about = 關於
+theme = 主題
 item-lang = 語言
 item-fullscreen = 全螢幕模式
 item-offline = 離線模式
@@ -16,6 +17,24 @@ item-mp-sub = 啟用多人遊戲
 item-mp-addr = 多人遊戲伺服器
 item-mp-addr-sub = 伺服器網址格式為「主機位址:埠號」
 item-mp-addr-invalid = 伺服器網址無效
+mp-server-page = 多人伺服器
+mp-server-none = 未選擇伺服器
+mp-server-current = 目前使用
+mp-server-name-title = 伺服器備註
+mp-server-name-prompt = 輸入伺服器備註
+mp-server-name-empty = 伺服器備註不能為空
+mp-server-address-title = 伺服器位址
+mp-server-address-prompt = 輸入主機:埠號位址
+mp-server-address-duplicate = 此伺服器位址已存在
+mp-server-added = 已新增伺服器地址
+mp-server-name-updated = 已更新伺服器名稱
+mp-server-address-updated = 已更新伺服器地址
+mp-server-deleted = 已刪除伺服器地址
+mp-server-selected = 已選擇伺服器地址
+mp-server-rename = 修改備註
+mp-server-edit-address = 修改位址
+mp-server-delete = 刪除
+mp-server-delete-confirm = 要刪除此多人伺服器嗎？
 item-lowq = 低畫質模式
 item-lowq-sub = 建議在畫面卡頓時啟用
 item-clear-cache = 清除快取
@@ -97,3 +116,11 @@ about-content =
     { $localization }
 
     以及許多志願譜面審核員！完整列表參見 https://phira.moe/staff
+
+item-render-backend = 渲染後端
+item-render-backend-sub = 重啟後生效
+item-render-backend-auto = 自動
+item-render-backend-wgpu = Vulkan
+item-render-backend-opengl = OpenGL
+item-perf-monitor = 即時監測
+item-perf-monitor-sub = 遊戲中左上角顯示FPS/CPU/記憶體/GPU/硬碟占用

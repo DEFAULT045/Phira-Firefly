@@ -6,6 +6,7 @@ audio = 音頻
 chart = 譜面
 debug = 調試
 about = 關於
+theme = 主題
 
 item-lang = 語言
 item-fullscreen = 全屏之態
@@ -19,6 +20,24 @@ item-mp-sub = 啓多人同戲
 item-mp-addr = 多人同戲之伺服器
 item-mp-addr-sub = 伺服器之位，「主機：端口」
 item-mp-addr-invalid = 無效之伺服器位
+mp-server-page = 多人同戲之伺服器
+mp-server-none = 未擇伺服器
+mp-server-current = 當前
+mp-server-name-title = 伺服器之名
+mp-server-name-prompt = 輸入伺服器之名
+mp-server-name-empty = 伺服器之名不可空
+mp-server-address-title = 伺服器之位
+mp-server-address-prompt = 輸入「主機：端口」之位
+mp-server-address-duplicate = 此伺服器之位已存
+mp-server-added = 已添伺服器之位
+mp-server-name-updated = 已新伺服器之名
+mp-server-address-updated = 已新伺服器之位
+mp-server-deleted = 已除伺服器之位
+mp-server-selected = 已擇伺服器之位
+mp-server-rename = 更名
+mp-server-edit-address = 改位
+mp-server-delete = 刪除
+mp-server-delete-confirm = 確欲刪此多人同戲之伺服器乎？
 item-lowq = 低畫質之態
 item-lowq-sub = 議於畫面滯時啓之
 item-clear-cache = 清緩存
@@ -56,6 +75,9 @@ item-opt = 激進之優
 item-opt-sub = 採激進之優化之策，增性能然或致部分譜面顯示有誤
 item-use-keyboard = 用鍵盤戲
 item-use-keyboard-sub = 啓後可用鍵盤戲，然成績不可上傳
+
+item-auto-record = 自動錄製回放
+item-auto-record-sub = 自動存錄回放，可於主頁 → 回放中觀之
 item-prefer-reduced-motion = 減動畫之效
 item-prefer-reduced-motion-sub = 減動畫與視覺之特效
 item-speed = 速
@@ -104,3 +126,11 @@ about-content =
   { $localization }
 
   以及衆多志願譜面審核員！完整之表見 https://phira.moe/staff
+
+item-render-backend = 渲染后端
+item-render-backend-sub = 重启后生效
+item-render-backend-auto = 自动
+item-render-backend-wgpu = Vulkan
+item-render-backend-opengl = OpenGL
+item-perf-monitor = 實時監測
+item-perf-monitor-sub = 局中左上顯FPS/CPU/內存/GPU/磁盤佔用

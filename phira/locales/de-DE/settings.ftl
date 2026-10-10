@@ -6,6 +6,7 @@ audio = Audio
 chart = Level
 debug = Debug
 about = Info
+theme = Design
 
 item-lang = Sprache
 item-offline = Offline Modus
@@ -18,6 +19,24 @@ item-mp-sub = Mehrspielerfunktion aktivieren.
 item-mp-addr = Mehrspieler-Server
 item-mp-addr-sub = Mit einem eigenen Mehrspieler-Server verbinden.
 item-mp-addr-invalid = Ungültige Serveradresse.
+mp-server-page = Mehrspieler-Server
+mp-server-none = Kein Server ausgewählt
+mp-server-current = Aktuell
+mp-server-name-title = Servername
+mp-server-name-prompt = Gib eine Bezeichnung für diesen Server ein.
+mp-server-name-empty = Der Servername darf nicht leer sein.
+mp-server-address-title = Serveradresse
+mp-server-address-prompt = Gib eine Host:Port-Adresse ein.
+mp-server-address-duplicate = Diese Serveradresse ist bereits vorhanden.
+mp-server-added = Serveradresse hinzugefügt.
+mp-server-name-updated = Servername aktualisiert.
+mp-server-address-updated = Serveradresse aktualisiert.
+mp-server-deleted = Serveradresse gelöscht.
+mp-server-selected = Serveradresse ausgewählt.
+mp-server-rename = Umbenennen
+mp-server-edit-address = Adresse bearbeiten
+mp-server-delete = Löschen
+mp-server-delete-confirm = Diesen Mehrspieler-Server löschen?
 item-lowq = Niedrige Auflösung
 item-lowq-sub = Reduziert die UI-Qualität für bessere Performance.
 item-clear-cache = Cache leeren
@@ -97,3 +116,11 @@ about-content =
   { $localization }
 
   Und viele weitere freiwillige Chart-Rezensenten. Eine vollständige Liste finden Sie unter https://phira.moe/staff
+
+item-render-backend = Render Backend
+item-render-backend-sub = Requires restart to take effect
+item-render-backend-auto = Auto
+item-render-backend-wgpu = Vulkan
+item-render-backend-opengl = OpenGL
+item-perf-monitor = Leistungsüberwachung
+item-perf-monitor-sub = FPS/CPU/Arbeitsspeicher/GPU/Festplatte oben links im Spiel anzeigen

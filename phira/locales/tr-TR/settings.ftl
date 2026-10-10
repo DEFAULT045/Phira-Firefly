@@ -6,6 +6,7 @@ audio = Ses
 chart = Müzikler
 debug = Hata Ayıklama
 about = Bilgi
+theme = Tema
 
 item-lang = Dil
 item-offline = Çevrimdışı Mod
@@ -15,6 +16,24 @@ item-mp-sub = Çok oyunculu modu devreye sok
 item-mp-addr = Çok oyunculu sunucu
 item-mp-addr-sub = Snucu adresi, 'host:port'
 item-mp-addr-invalid = Geçersiz sunucu adresi
+mp-server-page = Çok oyunculu sunucular
+mp-server-none = Sunucu seçilmedi
+mp-server-current = Geçerli
+mp-server-name-title = Sunucu adı
+mp-server-name-prompt = Bu sunucu için bir not girin.
+mp-server-name-empty = Sunucu adı boş olamaz.
+mp-server-address-title = Sunucu adresi
+mp-server-address-prompt = Bir host:port adresi girin.
+mp-server-address-duplicate = Bu sunucu adresi zaten var.
+mp-server-added = Sunucu adresi eklendi.
+mp-server-name-updated = Sunucu adı güncellendi.
+mp-server-address-updated = Sunucu adresi güncellendi.
+mp-server-deleted = Sunucu adresi silindi.
+mp-server-selected = Sunucu adresi seçildi.
+mp-server-rename = Yeniden adlandır
+mp-server-edit-address = Adresi düzenle
+mp-server-delete = Sil
+mp-server-delete-confirm = Bu çok oyunculu sunucu silinsin mi?
 item-lowq = Düşük kaliteli mod
 item-lowq-sub = Arayüz gecikmeliyse bunu seçin
 item-insecure = Emniyetsiz Mod
@@ -84,3 +103,11 @@ about-content =
   { $localization }
 
   Ve daha birçok gönüllü chart incelemecisi. Tam liste için https://phira.moe/staff adresine bakın
+
+item-render-backend = Render Backend
+item-render-backend-sub = Requires restart to take effect
+item-render-backend-auto = Auto
+item-render-backend-wgpu = Vulkan
+item-render-backend-opengl = OpenGL
+item-perf-monitor = Performans Monitörü
+item-perf-monitor-sub = Oyun içinde sol üstte FPS/CPU/Bellek/GPU/Disk kullanımını göster

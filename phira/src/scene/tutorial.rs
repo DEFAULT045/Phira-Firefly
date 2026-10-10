@@ -31,14 +31,15 @@ impl TutorialLoadingScene {
                 None,
                 None,
                 None,
+                None,
+                false,
+                None,
+                None,
             )
             .await?;
             Ok(scene)
         }));
-        Ok(Self {
-            load_task,
-            next_scene: None,
-        })
+        Ok(Self { load_task, next_scene: None })
     }
 }
 

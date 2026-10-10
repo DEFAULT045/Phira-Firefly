@@ -1,13 +1,10 @@
 use macroquad::prelude::*;
-use macroquad::text::{draw_text, measure_text};
-use prpr::{
-    ext::draw_text_aligned,
-    ui::{TextPainter, Ui},
-};
-use std::{
-    sync::Mutex,
-    time::SystemTime,
-};
+use macroquad::text::{draw_text_ex, measure_text, TextParams};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{sync::Mutex, time::SystemTime};
+use tracing::error;
+
+static SHOW_CRASH_DETAIL: AtomicBool = AtomicBool::new(false);
 
 pub struct CrashInfo {
     pub code: String,
@@ -19,12 +16,14 @@ pub struct CrashInfo {
 pub static CRASH_INFO: Mutex<Option<CrashInfo>> = Mutex::new(None);
 pub static CRASH_LOG_PATH: Mutex<String> = Mutex::new(String::new());
 
+static CRASH_LOG_CACHE: Mutex<String> = Mutex::new(String::new());
+
 const ERR_RENDER: &str = "0001";
 const ERR_AUDIO: &str = "0002";
 const ERR_RESOURCE: &str = "0003";
 const ERR_MEMORY: &str = "0004";
 const ERR_NETWORK: &str = "0005";
-const ERR_UNKNOWN: &str = "0999";
+const ERR_UNKNOWN: &str = "0010";
 
 pub fn set_log_path(path: &str) {
     if let Ok(mut guard) = CRASH_LOG_PATH.lock() {
@@ -42,20 +41,9 @@ pub fn classify_panic(info: &str) -> (&'static str, &'static str) {
         || lower.contains("gl")
         || lower.contains("draw")
     {
-        (
-            ERR_RENDER,
-            "游戏渲染引擎发生严重错误，图形系统无法正常工作。建议更新显卡驱动或降低画质设置后重试。",
-        )
-    } else if lower.contains("audio")
-        || lower.contains("sound")
-        || lower.contains("music")
-        || lower.contains("playback")
-        || lower.contains("sfx")
-    {
-        (
-            ERR_AUDIO,
-            "音频系统出现崩溃，无法正常播放音乐或音效。请检查音频设备是否被其他程序占用。",
-        )
+        (ERR_RENDER, "游戏渲染引擎发生严重错误，图形系统无法正常工作。建议更新显卡驱动或降低画质设置后重试。")
+    } else if lower.contains("audio") || lower.contains("sound") || lower.contains("music") || lower.contains("playback") || lower.contains("sfx") {
+        (ERR_AUDIO, "音频系统出现崩溃，无法正常播放音乐或音效。请检查音频设备是否被其他程序占用。")
     } else if lower.contains("load")
         || lower.contains("file")
         || lower.contains("assets")
@@ -64,19 +52,9 @@ pub fn classify_panic(info: &str) -> (&'static str, &'static str) {
         || lower.contains("not found")
         || lower.contains("不存在")
     {
-        (
-            ERR_RESOURCE,
-            "游戏资源加载失败，可能由于文件损坏或缺失。建议验证游戏文件完整性后重试。",
-        )
-    } else if lower.contains("memory")
-        || lower.contains("alloc")
-        || lower.contains("out of memory")
-        || lower.contains("failed to allocate")
-    {
-        (
-            ERR_MEMORY,
-            "系统内存不足，无法继续运行游戏。请关闭其他程序释放内存后重试。",
-        )
+        (ERR_RESOURCE, "游戏资源加载失败，可能由于文件损坏或缺失。建议验证游戏文件完整性后重试。")
+    } else if lower.contains("memory") || lower.contains("alloc") || lower.contains("out of memory") || lower.contains("failed to allocate") {
+        (ERR_MEMORY, "系统内存不足，无法继续运行游戏。请关闭其他程序释放内存后重试。")
     } else if lower.contains("network")
         || lower.contains("connection")
         || lower.contains("http")
@@ -84,27 +62,30 @@ pub fn classify_panic(info: &str) -> (&'static str, &'static str) {
         || lower.contains("timeout")
         || lower.contains("dns")
     {
-        (
-            ERR_NETWORK,
-            "网络连接异常，无法与服务器通信。请检查网络连接后重试。",
-        )
+        (ERR_NETWORK, "网络连接异常，无法与服务器通信。请检查网络连接后重试。")
     } else {
         (ERR_UNKNOWN, "无法预计的游戏程序失败")
     }
 }
 
 pub fn write_crash_log(info: &CrashInfo) {
+    
     let log = format!(
-        "[{}]\n错误代码: {}\n错误描述: {}\n崩溃信息: {}\n",
+        "========== 崩溃记录 ==========\n[{}]\n错误代码: {}\n错误描述: {}\n崩溃信息: {}\n\n",
         info.timestamp, info.code, info.message, info.panic_info
     );
     let path = CRASH_LOG_PATH.lock().unwrap();
-    let path = if path.is_empty() {
-        "crash.log".to_owned()
-    } else {
-        path.clone()
-    };
-    let _ = std::fs::write(&path, log);
+    let path = if path.is_empty() { "crash.log".to_owned() } else { path.clone() };
+    use std::io::Write;
+    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(mut file) => {
+            let _ = file.write_all(log.as_bytes());
+        }
+        Err(_) => {
+            
+            let _ = std::fs::write(&path, log);
+        }
+    }
 }
 
 pub fn set_panic_hook() {
@@ -123,11 +104,15 @@ pub fn set_panic_hook() {
             panic_msg
         };
 
+        
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let log_detail = format!("{}\n\n调用栈:\n{}", detailed, backtrace);
+
         let (code, message) = classify_panic(&detailed);
         let crash_info = CrashInfo {
             code: code.to_string(),
             message: message.to_string(),
-            panic_info: detailed,
+            panic_info: log_detail,
             timestamp: format!("{:?}", SystemTime::now()),
         };
         write_crash_log(&crash_info);
@@ -137,7 +122,6 @@ pub fn set_panic_hook() {
     }));
 }
 
-/// 手动设置非 panic 导致的崩溃信息（如启动时资源加载失败）
 pub fn set_error(error_msg: &str) {
     let (code, message) = classify_panic(error_msg);
     let crash_info = CrashInfo {
@@ -152,99 +136,58 @@ pub fn set_error(error_msg: &str) {
     }
 }
 
-pub fn render_crash_screen(logo: Option<Texture2D>, painter: &mut TextPainter) {
-    let mut ui = Ui::new(painter, None);
-    let top = ui.top;
-
-    push_camera_state();
-    set_camera(&ui.camera());
-
-    // 全屏白色背景
-    ui.fill_rect(Rect::new(-1.0, -top, 2.0, 2.0 * top), WHITE);
-
-    let info = CRASH_INFO.lock().unwrap();
-    let Some(info) = info.as_ref() else {
-        pop_camera_state();
-        return;
-    };
-
-    // Logo（最上方，保持比例，不裁切）
-    let _logo_bottom = if let Some(logo) = logo {
-        let logo_w = logo.width();
-        let logo_h = logo.height();
-        let max_ndc_w = 1.2;
-        let max_ndc_h = top * 0.90;
-        let logo_ndc_w = logo_w / (screen_width() / 2.0);
-        let logo_ndc_h = logo_h / (screen_width() / 2.0);
-        let scale = (max_ndc_w / logo_ndc_w).min(max_ndc_h / logo_ndc_h).min(1.0);
-        let ndc_w = logo_ndc_w * scale;
-        let ndc_h = logo_ndc_h * scale;
-        let x = -ndc_w / 2.0;
-        let y = -top * 0.75;
-        draw_texture_ex(
-            logo,
-            x,
-            y,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(vec2(ndc_w, ndc_h)),
-                ..Default::default()
-            },
-        );
-        Some(y + ndc_h)
+pub fn capture_panic(payload: Box<dyn std::any::Any + Send>) {
+    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
     } else {
-        None
+        "Unknown panic".to_string()
     };
-
-    // 文字组固定在屏幕下半部分的1/4处，组内间隔小
-    let version_y = top * 0.40;
-    let error_y = version_y + 0.07;
-    let message_y = error_y + 0.09;
-
-    // PHIRA-FIREFLY {version}
-    let version = env!("CARGO_PKG_VERSION");
-    let version_text = format!("PHIRA-FIREFLY {}", version);
-    draw_text_aligned(
-        &mut ui,
-        &version_text,
-        0.0,
-        version_y,
-        (0.5, 0.5),
-        0.5,
-        Color::new(0.0, 0.0, 0.0, 1.0),
-    );
-
-    // 红色呼吸效果（从 #F00 到 #F80）
-    let t = get_time();
-    let depth = ((t * 8.0).sin() as f32 * 0.5 + 0.5) * 8.0;
-    let g = depth / 8.0;
-    let red_color = Color::new(1.0, g, 0.0, 1.0);
-
-    // ERROR 错误代码
-    let title = format!("ERROR {}", info.code);
-    draw_text_aligned(&mut ui, &title, 0.0, error_y, (0.5, 0.5), 0.72, red_color);
-
-    // 错误信息（换行）
-    ui.text(&info.message)
-        .pos(0.0, message_y)
-        .anchor(0.5, 0.5)
-        .size(0.38)
-        .color(red_color)
-        .multiline()
-        .max_width(1.6)
-        .draw();
-
-    pop_camera_state();
+    let (code, message) = classify_panic(&msg);
+    let crash_info = CrashInfo {
+        code: code.to_string(),
+        message: message.to_string(),
+        panic_info: msg,
+        timestamp: format!("{:?}", SystemTime::now()),
+    };
+    write_crash_log(&crash_info);
+    if let Ok(mut guard) = CRASH_INFO.lock() {
+        *guard = Some(crash_info);
+    }
 }
 
-/// 当 TextPainter/字体不可用时使用的备用崩溃界面渲染（使用 macroquad 默认字体）
-pub fn render_crash_screen_fallback(logo: Option<Texture2D>) {
+pub fn refresh_log_cache() {
+    let path = {
+        let guard = CRASH_LOG_PATH.lock().unwrap();
+        if guard.is_empty() {
+            "crash.log".to_owned()
+        } else {
+            guard.clone()
+        }
+    };
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Ok(mut guard) = CRASH_LOG_CACHE.lock() {
+        *guard = content;
+    }
+}
+
+pub fn reset_gl_state() {
+    set_default_camera();
+    unsafe { get_internal_gl() }.quad_gl.viewport(None);
+    unsafe { get_internal_gl() }.quad_gl.scissor(None);
+}
+
+pub fn render_crash_screen(logo: Option<Texture2D>, font: Option<macroquad::text::Font>) {
+    reset_gl_state();
     clear_background(WHITE);
+
+    
+    let font = font.unwrap_or_default();
 
     let sw = screen_width();
     let sh = screen_height();
 
-    // Logo（最上方，保持比例，不裁切）
     if let Some(logo) = logo {
         let logo_w = logo.width();
         let logo_h = logo.height();
@@ -254,7 +197,7 @@ pub fn render_crash_screen_fallback(logo: Option<Texture2D>) {
         let w = logo_w * scale;
         let h = logo_h * scale;
         let x = (sw - w) / 2.0;
-        let y = sh * 0.10;
+        let y = sh * 0.25 - h / 2.0;
         draw_texture_ex(
             logo,
             x,
@@ -267,41 +210,193 @@ pub fn render_crash_screen_fallback(logo: Option<Texture2D>) {
         );
     }
 
-    let info = CRASH_INFO.lock().unwrap();
-    let Some(info) = info.as_ref() else { return; };
+    
+    
+    let (code, message, panic_info) = {
+        let guard = CRASH_INFO.lock().unwrap();
+        match guard.as_ref() {
+            Some(i) => (i.code.clone(), i.message.clone(), i.panic_info.clone()),
+            None => {
+                error!("CRASH_INFO is empty when rendering crash screen, using fallback text");
+                (
+                    "0010".to_owned(),
+                    "无法预计的游戏程序失败".to_owned(),
+                    String::new(),
+                )
+            }
+        }
+    };
 
-    // PHIRA-FIREFLY {version}
     let version_text = format!("PHIRA-FIREFLY {}", env!("CARGO_PKG_VERSION"));
     let version_size = sh * 0.035;
-    let version_dims = measure_text(&version_text, None, version_size as u16, 1.0);
-    draw_text(
+    let version_dims = measure_text(&version_text, Some(font), version_size as u16, 1.0);
+    draw_text_ex(
         &version_text,
         (sw - version_dims.width) / 2.0,
         sh * 0.55,
-        version_size,
-        Color::new(0.0, 0.0, 0.0, 1.0),
+        TextParams {
+            font,
+            font_size: version_size as u16,
+            font_scale: 1.0,
+            color: Color::new(0.0, 0.0, 0.0, 1.0),
+            ..Default::default()
+        },
     );
 
-    // 红色呼吸效果
     let t = get_time();
     let depth = ((t * 8.0).sin() as f32 * 0.5 + 0.5) * 8.0;
     let g = depth / 8.0;
     let red_color = Color::new(1.0, g, 0.0, 1.0);
 
-    // ERROR 错误代码
-    let title = format!("ERROR {}", info.code);
+    let title = format!("ERROR {}", code);
     let error_size = sh * 0.050;
-    let error_dims = measure_text(&title, None, error_size as u16, 1.0);
-    draw_text(&title, (sw - error_dims.width) / 2.0, sh * 0.65, error_size, red_color);
-
-    // 错误信息
-    let message_size = sh * 0.025;
-    let message_dims = measure_text(&info.message, None, message_size as u16, 1.0);
-    draw_text(
-        &info.message,
-        (sw - message_dims.width) / 2.0,
-        sh * 0.72,
-        message_size,
-        red_color,
+    let error_dims = measure_text(&title, Some(font), error_size as u16, 1.0);
+    draw_text_ex(
+        &title,
+        (sw - error_dims.width) / 2.0,
+        sh * 0.65,
+        TextParams {
+            font,
+            font_size: error_size as u16,
+            font_scale: 1.0,
+            color: red_color,
+            ..Default::default()
+        },
     );
+
+    let message_size = sh * 0.025;
+    let max_text_width = sw * 0.85;
+    let line_height = message_size * 1.3;
+    let mut cur_y = sh * 0.72;
+    for line in wrap_text(&message, font, message_size as u16, max_text_width) {
+        let dims = measure_text(&line, Some(font), message_size as u16, 1.0);
+        draw_text_ex(
+            &line,
+            (sw - dims.width) / 2.0,
+            cur_y,
+            TextParams {
+                font,
+                font_size: message_size as u16,
+                font_scale: 1.0,
+                color: red_color,
+                ..Default::default()
+            },
+        );
+        cur_y += line_height;
+    }
+
+    
+    let touch_started = touches().iter().any(|t| t.phase == TouchPhase::Started);
+    if touch_started
+        || is_mouse_button_pressed(MouseButton::Left)
+        || is_mouse_button_pressed(MouseButton::Right)
+        || is_key_pressed(KeyCode::Space)
+    {
+        let new_state = !SHOW_CRASH_DETAIL.load(Ordering::Relaxed);
+        SHOW_CRASH_DETAIL.store(new_state, Ordering::Relaxed);
+        if new_state {
+            
+            refresh_log_cache();
+        }
+    }
+
+    if SHOW_CRASH_DETAIL.load(Ordering::Relaxed) {
+        if !panic_info.is_empty() {
+            let panic_size = sh * 0.018;
+            let panic_height = panic_size * 1.2;
+            cur_y += sh * 0.012;
+            let panic_lines = wrap_text(&panic_info, font, panic_size as u16, max_text_width);
+            for line in panic_lines.iter().take(14) {
+                let dims = measure_text(line, Some(font), panic_size as u16, 1.0);
+                draw_text_ex(
+                    line,
+                    (sw - dims.width) / 2.0,
+                    cur_y,
+                    TextParams {
+                        font,
+                        font_size: panic_size as u16,
+                        font_scale: 1.0,
+                        color: Color::new(0.3, 0.3, 0.3, 1.0),
+                        ..Default::default()
+                    },
+                );
+                cur_y += panic_height;
+            }
+        } else {
+        
+        let info_size = sh * 0.020;
+        let info_height = info_size * 1.35;
+        cur_y += sh * 0.012;
+        let mut draw_line = |text: &str| {
+                let dims = measure_text(text, Some(font), info_size as u16, 1.0);
+                draw_text_ex(
+                    text,
+                    (sw - dims.width) / 2.0,
+                    cur_y,
+                    TextParams {
+                        font,
+                        font_size: info_size as u16,
+                        font_scale: 1.0,
+                        color: Color::new(0.3, 0.3, 0.3, 1.0),
+                        ..Default::default()
+                    },
+                );
+                cur_y += info_height;
+            };
+            draw_line("未捕获到 CRASH_INFO，以下为 crash.log 内容：");
+            draw_line(&format!("错误代码: {}", code));
+            let log_cache = CRASH_LOG_CACHE.lock().unwrap().clone();
+            if log_cache.is_empty() {
+                draw_line("crash.log 为空或无权限读取（请确认应用已写入过崩溃记录）");
+            } else {
+                for line in wrap_text(&log_cache, font, info_size as u16, max_text_width)
+                    .into_iter()
+                    .take(22)
+                {
+                    draw_line(&line);
+                }
+            }
+        }
+    } else {
+        
+        let hint = "点击屏幕查看崩溃详情";
+        let hint_size = sh * 0.022;
+        let hint_dims = measure_text(hint, Some(font), hint_size as u16, 1.0);
+        draw_text_ex(
+            hint,
+            (sw - hint_dims.width) / 2.0,
+            sh * 0.90,
+            TextParams {
+                font,
+                font_size: hint_size as u16,
+                font_scale: 1.0,
+                color: Color::new(0.55, 0.55, 0.55, 1.0),
+                ..Default::default()
+            },
+        );
+    }
+}
+
+fn wrap_text(text: &str, font: macroquad::text::Font, font_size: u16, max_width: f32) -> Vec<String> {
+    let mut lines = Vec::new();
+    for paragraph in text.split('\n') {
+        if paragraph.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current_line = String::new();
+        for ch in paragraph.chars() {
+            let test = format!("{}{}", current_line, ch);
+            let w = measure_text(&test, Some(font), font_size, 1.0).width;
+            if w > max_width && !current_line.is_empty() {
+                lines.push(current_line);
+                current_line = String::new();
+            }
+            current_line.push(ch);
+        }
+        if !current_line.is_empty() {
+            lines.push(current_line);
+        }
+    }
+    lines
 }

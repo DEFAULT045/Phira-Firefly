@@ -6,6 +6,7 @@ audio = Audio
 chart = Beatmap
 debug = Debug
 about = Info
+theme = ธีม
 
 item-lang = ภาษา
 item-offline = Offline mode
@@ -18,6 +19,24 @@ item-mp-sub = เปิดโหมด Multiplayer
 item-mp-addr = Multiplayer server
 item-mp-addr-sub = Server address, 'host:port'
 item-mp-addr-invalid = Server ไม่ถูกต้อง
+mp-server-page = เซิร์ฟเวอร์หลายผู้เล่น
+mp-server-none = ยังไม่ได้เลือกเซิร์ฟเวอร์
+mp-server-current = ปัจจุบัน
+mp-server-name-title = ชื่อเซิร์ฟเวอร์
+mp-server-name-prompt = ใส่หมายเหตุสำหรับเซิร์ฟเวอร์นี้
+mp-server-name-empty = ชื่อเซิร์ฟเวอร์ห้ามว่าง
+mp-server-address-title = ที่อยู่เซิร์ฟเวอร์
+mp-server-address-prompt = ใส่ที่อยู่ host:port
+mp-server-address-duplicate = ที่อยู่เซิร์ฟเวอร์นี้มีอยู่แล้ว
+mp-server-added = เพิ่มที่อยู่เซิร์ฟเวอร์แล้ว
+mp-server-name-updated = อัปเดตชื่อเซิร์ฟเวอร์แล้ว
+mp-server-address-updated = อัปเดตที่อยู่เซิร์ฟเวอร์แล้ว
+mp-server-deleted = ลบที่อยู่เซิร์ฟเวอร์แล้ว
+mp-server-selected = เลือกที่อยู่เซิร์ฟเวอร์แล้ว
+mp-server-rename = เปลี่ยนชื่อ
+mp-server-edit-address = แก้ไขที่อยู่
+mp-server-delete = ลบ
+mp-server-delete-confirm = ลบเซิร์ฟเวอร์หลายผู้เล่นนี้หรือไม่?
 item-lowq = Low quality mode
 item-lowq-sub = ให้เพื่อลดคุณภาพของ UI, ให้ประสิทธิภาพของเกทเพิ่มขึ้น
 item-clear-cache = ล้าง Cache
@@ -97,3 +116,11 @@ about-content =
   { $localization }
 
   และผู้ตรวจสอบชาร์ตอาสาสมัครอีกมากมาย สำหรับรายการทั้งหมดโปรดดูที่ https://phira.moe/staff
+
+item-render-backend = Render Backend
+item-render-backend-sub = Requires restart to take effect
+item-render-backend-auto = Auto
+item-render-backend-wgpu = Vulkan
+item-render-backend-opengl = OpenGL
+item-perf-monitor = ตรวจสอบประสิทธิภาพ
+item-perf-monitor-sub = แสดง FPS/CPU/หน่วยความจำ/GPU/ดิสก์ที่มุมบนซ้ายในเกม

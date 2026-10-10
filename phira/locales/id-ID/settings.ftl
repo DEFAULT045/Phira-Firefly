@@ -6,6 +6,7 @@ audio = Suara
 chart = Chart
 debug = Debug
 about = Tentang
+theme = Tema
 
 item-lang = Bahasa
 item-offline = Mode Offline
@@ -15,6 +16,24 @@ item-mp-sub = Hidupkan mode multiplayer
 item-mp-addr = Multiplayer server
 item-mp-addr-sub = Server address, 'host:port'
 item-mp-addr-invalid = Server address tidak valid
+mp-server-page = Server Multiplayer
+mp-server-none = Belum ada server yang dipilih
+mp-server-current = Saat ini
+mp-server-name-title = Nama Server
+mp-server-name-prompt = Masukkan catatan untuk server ini.
+mp-server-name-empty = Nama server tidak boleh kosong.
+mp-server-address-title = Alamat Server
+mp-server-address-prompt = Masukkan alamat host:port.
+mp-server-address-duplicate = Alamat server ini sudah ada.
+mp-server-added = Alamat server ditambahkan.
+mp-server-name-updated = Nama server diperbarui.
+mp-server-address-updated = Alamat server diperbarui.
+mp-server-deleted = Alamat server dihapus.
+mp-server-selected = Alamat server dipilih.
+mp-server-rename = Ubah Nama
+mp-server-edit-address = Ubah Alamat
+mp-server-delete = Hapus
+mp-server-delete-confirm = Hapus server multiplayer ini?
 item-lowq = Mode Kualitas Rendah
 item-lowq-sub = Aktifkan ini jika UI nge-lag
 item-insecure = Mode insecure
@@ -79,3 +98,11 @@ about-content =
   { $localization }
 
   Dan banyak lagi peninjau chart sukarela. Untuk daftar lengkap, silakan merujuk ke https://phira.moe/staff
+
+item-render-backend = Render Backend
+item-render-backend-sub = Requires restart to take effect
+item-render-backend-auto = Auto
+item-render-backend-wgpu = Vulkan
+item-render-backend-opengl = OpenGL
+item-perf-monitor = Monitor Performa
+item-perf-monitor-sub = Tampilkan FPS/CPU/Memori/GPU/Disk di kiri atas saat bermain

@@ -1,4 +1,4 @@
-use super::{chart::ChartSettings, BpmList, CtrlObject, JudgeLine, Matrix, Object, Point, Resource};
+﻿use super::{chart::ChartSettings, BpmList, CtrlObject, JudgeLine, Matrix, Object, Point, Resource};
 pub use crate::{
     config::Mods,
     judge::{HitSound, JudgeStatus, LIMIT_BAD},
@@ -138,9 +138,9 @@ impl Note {
         // && self.ctrl_obj.is_default()
     }
 
-    pub fn update(&mut self, res: &mut Resource, parent_rot: f32, parent_tr: &Matrix, ctrl_obj: &mut CtrlObject, line_height: f64) {
+    pub fn update(&mut self, res: &Resource, parent_rot: f32, parent_tr: &Matrix, ctrl_obj: &mut CtrlObject, line_height: f64) -> Option<super::chart::ParticleEmitRequest> {
         self.object.set_time(res.time);
-        if let Some(color) = if let JudgeStatus::Hold(perfect, at, ..) = &mut self.judge {
+        let emit_color = if let JudgeStatus::Hold(perfect, at, ..) = &mut self.judge {
             if res.time > *at {
                 *at += HOLD_PARTICLE_INTERVAL / res.config.speed as f64;
                 Some(self.fx_color.unwrap_or_else(|| {
@@ -155,12 +155,14 @@ impl Note {
             }
         } else {
             None
-        } {
+        };
+        if let Some(color) = emit_color {
             self.init_ctrl_obj(ctrl_obj, line_height);
-            res.with_model(parent_tr * self.now_transform(res, ctrl_obj, 0., 0.), |res| {
-                res.emit_at_origin(parent_rot + if self.above { 0. } else { 180. }, color)
-            });
+            let transform = parent_tr * self.now_transform(res, ctrl_obj, 0., 0.);
+            let rotation = parent_rot + if self.above { 0. } else { 180. };
+            return Some(super::chart::ParticleEmitRequest { transform, rotation, color });
         }
+        None
     }
 
     pub fn dead(&self) -> bool {
@@ -239,6 +241,8 @@ impl Note {
         {
             return;
         }
+
+
         let order = self.kind.order();
         let style = if res.config.double_hint && self.multiple_hint {
             &res.res_pack.note_style_mh

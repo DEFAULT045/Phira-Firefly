@@ -6,6 +6,7 @@ audio = 音频
 chart = 谱面
 debug = 调试
 about = 关于
+theme = 主题
 
 item-lang = 语言
 item-fullscreen = 全屏模式
@@ -19,6 +20,24 @@ item-mp-sub = 启用多人游戏
 item-mp-addr = 多人游戏服务器
 item-mp-addr-sub = 服务器地址，'主机:端口'
 item-mp-addr-invalid = 无效的服务器地址
+mp-server-page = 多人服务器
+mp-server-none = 未选择服务器
+mp-server-current = 当前
+mp-server-name-title = 服务器名称
+mp-server-name-prompt = 输入服务器名称
+mp-server-name-empty = 服务器名称不能为空
+mp-server-address-title = 服务器地址
+mp-server-address-prompt = 输入主机:端口地址
+mp-server-address-duplicate = 该服务器地址已存在
+mp-server-added = 已添加服务器地址
+mp-server-name-updated = 已更新服务器名称
+mp-server-address-updated = 已更新服务器地址
+mp-server-deleted = 已删除服务器地址
+mp-server-selected = 已选择服务器地址
+mp-server-rename = 修改名称
+mp-server-edit-address = 修改地址
+mp-server-delete = 删除
+mp-server-delete-confirm = 要删除这个多人服务器吗？
 item-lowq = 低画质模式
 item-lowq-sub = 建议在画面卡顿时启用
 item-clear-cache = 清除缓存
@@ -56,6 +75,9 @@ item-opt = 激进优化
 item-opt-sub = 采用激进的优化策略，提升性能但可能导致部分谱面显示出错
 item-use-keyboard = 使用键盘游玩
 item-use-keyboard-sub = 开启后可以使用键盘进行游戏，但成绩无法上传
+
+item-auto-record = 自动录制回放
+item-auto-record-sub = 自动保存回放，可在首页 → 回放中查看
 item-prefer-reduced-motion = 减少动画效果
 item-prefer-reduced-motion-sub = 减少动画和视觉特效
 item-watch-tutorial = 观看教学
@@ -70,6 +92,12 @@ item-touch-debug = 触摸调试
 item-touch-debug-sub = 游玩过程中显示触摸点
 
 load-cali-failed = 音频被流萤吃掉了
+
+item-dynamic-bg = 动态背景
+item-dynamic-bg-sub = 强制启用所有谱面的实时演算动态背景
+dynamic-bg-off = 关闭
+dynamic-bg-static = 固定亮度
+dynamic-bg-dynamic = 动态亮度
 
 about-content =
   Phira-Firefly v{ $version }
@@ -107,3 +135,11 @@ about-content =
   { $localization }
 
   以及许多志愿谱面审核员！完整列表参见 https://phira.moe/staff
+
+item-render-backend = 渲染后端
+item-render-backend-sub = 重启后生效
+item-render-backend-auto = 自动
+item-render-backend-wgpu = Vulkan
+item-render-backend-opengl = OpenGL
+item-perf-monitor = 实时监测
+item-perf-monitor-sub = 游戏中左上角显示FPS/CPU/内存/GPU/硬盘占用

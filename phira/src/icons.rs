@@ -31,6 +31,7 @@ pub struct Icons {
     pub cloud_none: SafeTexture,
     pub cloud_check: SafeTexture,
     pub plus: SafeTexture,
+    pub export: SafeTexture,
     pub select: SafeTexture,
 
     pub r#abstract: SafeTexture,
@@ -39,7 +40,7 @@ pub struct Icons {
 impl Icons {
     pub async fn new() -> Result<Self> {
         Ok(Self {
-            icon: load_texture("icon.png").await?.into(),
+            icon: prpr::theme::load_asset_texture("icon.png").await?.into(),
             play: load_texture("resume.png").await?.into(),
             medal: load_texture("medal.png").await?.into(),
             respack: load_texture("respack.png").await?.into(),
@@ -66,9 +67,10 @@ impl Icons {
             cloud_none: load_texture("cloud_none.png").await?.into(),
             cloud_check: load_texture("cloud_check.png").await?.into(),
             plus: load_texture("plus.png").await?.into(),
+            export: load_texture("export.png").await?.into(),
             select: load_texture("select.png").await?.into(),
 
-            r#abstract: load_texture("abstract.jpg").await?.into(),
+            r#abstract: prpr::theme::load_asset_texture("abstract.jpg").await?.into(),
         })
     }
 }

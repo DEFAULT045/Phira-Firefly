@@ -6,6 +6,7 @@ audio = Audio
 chart = Chart
 debug = Debug
 about = Info
+theme = Theme
 
 item-lang = Language
 item-fullscreen = Fullscreen Mode
@@ -19,6 +20,24 @@ item-mp-sub = Enable multiplayer functionality.
 item-mp-addr = Multiplayer Server
 item-mp-addr-sub = Connect to a custom multiplayer server.
 item-mp-addr-invalid = Invalid server address.
+mp-server-page = Multiplayer Servers
+mp-server-none = No server selected
+mp-server-current = Current
+mp-server-name-title = Server Name
+mp-server-name-prompt = Enter a note for this server.
+mp-server-name-empty = Server name cannot be empty.
+mp-server-address-title = Server Address
+mp-server-address-prompt = Enter a host:port address.
+mp-server-address-duplicate = This server address already exists.
+mp-server-added = Server address added.
+mp-server-name-updated = Server name updated.
+mp-server-address-updated = Server address updated.
+mp-server-deleted = Server address deleted.
+mp-server-selected = Server address selected.
+mp-server-rename = Rename
+mp-server-edit-address = Edit Address
+mp-server-delete = Delete
+mp-server-delete-confirm = Delete this multiplayer server?
 item-lowq = Low Resolution Mode
 item-lowq-sub = Lower the quality of the UI, increasing peformance.
 item-clear-cache = Clear Cache
@@ -56,6 +75,9 @@ item-opt = Chart Optimization
 item-opt-sub = Significantly increase peformance while playing. (If unintended behavior arises, disable this.)
 item-use-keyboard = Use Keyboard
 item-use-keyboard-sub = Enable keyboard input for gameplay. Scores cannot be uploaded when enabled.
+
+item-auto-record = Auto-record replays
+item-auto-record-sub = Replays are saved automatically. View them from Home → Replays.
 item-prefer-reduced-motion = Prefer Reduced Motion
 item-prefer-reduced-motion-sub = Reduce animations and visual effects
 item-watch-tutorial = Watch Tutorial
@@ -70,6 +92,12 @@ item-touch-debug = Show Touch Points
 item-touch-debug-sub = Display user touch points.
 
 load-cali-failed = Failed to load calibration audio.
+
+item-dynamic-bg = Dynamic Background
+item-dynamic-bg-sub = Force real-time dynamic background on all charts.
+dynamic-bg-off = Off
+dynamic-bg-static = Static Brightness
+dynamic-bg-dynamic = Dynamic Brightness
 
 about-content =
   Phira v{ $version }
@@ -108,3 +136,11 @@ about-content =
   { $localization }
 
   And many more voluntary chart reviewers. For a full list please refer to https://phira.moe/staff .
+
+item-render-backend = Render Backend
+item-render-backend-sub = Requires restart to take effect
+item-render-backend-auto = Auto
+item-render-backend-wgpu = Vulkan
+item-render-backend-opengl = OpenGL
+item-perf-monitor = Performance Monitor
+item-perf-monitor-sub = Show FPS/CPU/Memory/GPU/Disk usage in-game top-left

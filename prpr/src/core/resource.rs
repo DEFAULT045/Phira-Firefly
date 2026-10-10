@@ -1,10 +1,11 @@
-use super::{MSRenderTarget, Matrix, Point, NOTE_WIDTH_RATIO_BASE};
+use super::{DynamicBackground, MSRenderTarget, Matrix, Point, NOTE_WIDTH_RATIO_BASE};
 use crate::{
     config::Config,
     ext::{create_audio_manger, nalgebra_to_glm, SafeTexture},
     fs::FileSystem,
     info::ChartInfo,
     particle::{AtlasConfig, ColorCurve, Emitter, EmitterConfig},
+    theme::load_asset_image,
 };
 use anyhow::{bail, Context, Result};
 use macroquad::prelude::*;
@@ -22,7 +23,11 @@ use std::{
     sync::atomic::AtomicU32,
 };
 
-pub const MAX_SIZE: usize = 64; // needs tweaking
+/// Override the music track length when running in headless render mode.
+thread_local! {
+    pub static TRACK_LENGTH_OVERRIDE: RefCell<Option<f64>> = const { RefCell::new(None) };
+}
+pub const MAX_SIZE: usize = 256; // 每个 mesh 最多 256 个四边形，减少 draw call 拆分
 pub static DPI_VALUE: AtomicU32 = AtomicU32::new(250);
 pub const BUFFER_SIZE: usize = 1024;
 
@@ -293,7 +298,10 @@ impl ResourcePack {
             sfx_click: load_clip!("click"),
             sfx_drag: load_clip!("drag"),
             sfx_flick: load_clip!("flick"),
-            ending: load_clip!("ending"),
+            ending: match crate::theme::load_asset_file("ending.ogg").await {
+                Ok(bytes) => AudioClip::new(bytes)?,
+                Err(_) => load_clip!("ending"),
+            },
             hit_fx,
         })
     }
@@ -329,6 +337,7 @@ impl ParticleEmitter {
                 atlas: Some(AtlasConfig::new(res_pack.info.hit_fx.0 as _, res_pack.info.hit_fx.1 as _, ..)),
                 emitting: false,
                 colors_curve,
+                gpu_driven: true,
                 ..Default::default()
             }),
             emitter_square: Emitter::new(EmitterConfig {
@@ -342,6 +351,7 @@ impl ParticleEmitter {
                 initial_velocity_randomness: 1. / 10.,
                 linear_accel: -6. / 1.,
                 colors_curve,
+                gpu_driven: true,
                 ..Default::default()
             }),
             hide_particles,
@@ -350,11 +360,19 @@ impl ParticleEmitter {
         Ok(res)
     }
 
+    /// 方形扩散粒子同时存在的上限
+    const MAX_PARTICLES: usize = 20;
+    const MAX_HIT_FX_PARTICLES: usize = 65536;
+
     pub fn emit_at(&mut self, pt: Vec2, rotation: f32, color: Color) {
         self.emitter.config.initial_rotation = rotation;
         self.emitter.config.base_color = color;
-        self.emitter.emit(pt, 1);
-        if !self.hide_particles {
+        // 打击特效（序列帧）最多同时存在65536个
+        if self.emitter.particle_count() < Self::MAX_HIT_FX_PARTICLES {
+            self.emitter.emit(pt, 1);
+        }
+        // 方形扩散粒子：最多同时存在20个Note的粒子效果
+        if !self.hide_particles && self.emitter_square.particle_count() < Self::MAX_PARTICLES {
             self.emitter_square.config.base_color = color;
             self.emitter_square.emit(pt, 4);
         }
@@ -421,6 +439,7 @@ pub struct Resource {
 
     pub background: SafeTexture,
     pub illustration: SafeTexture,
+    pub dynamic_bg: Option<DynamicBackground>,
     pub icons: [SafeTexture; 8],
     pub mod_icons: [SafeTexture; 7],
     pub res_pack: ResourcePack,
@@ -455,9 +474,13 @@ macro_rules! loads {
     };
 
     (@detail $path:literal) => {
-        Texture2D::from_image(&load_image($path).await?).into()
+        Texture2D::from_image(&load_asset_image($path).await?).into()
     };
 }
+
+// 安全保证：rayon 并行更新阶段只只读访问 Resource，
+// 不访问 emitter（粒子发射分离到串行阶段）和 note_buffer（仅渲染时使用）。
+unsafe impl Sync for Resource {}
 
 impl Resource {
     pub async fn load_icons() -> Result<[SafeTexture; 8]> {
@@ -492,11 +515,12 @@ impl Resource {
         player: Option<SafeTexture>,
         background: SafeTexture,
         illustration: SafeTexture,
+        mut dynamic_bg: Option<DynamicBackground>,
         has_no_effect: bool,
     ) -> Result<Self> {
         macro_rules! load_tex {
             ($path:literal) => {
-                SafeTexture::from(Texture2D::from_image(&load_image($path).await?))
+                SafeTexture::from(Texture2D::from_image(&load_asset_image($path).await?))
             };
         }
         let res_pack = ResourcePack::from_path(config.res_pack_path.as_ref())
@@ -509,8 +533,16 @@ impl Resource {
         };
 
         let mut audio = create_audio_manger(&config)?;
-        let music = AudioClip::new(fs.load_file(&info.music).await?)?;
-        let track_length = music.length();
+        let music_bytes = fs.load_file(&info.music).await?;
+        let music = AudioClip::new(music_bytes.clone())?;
+        if let Some(dbg) = &mut dynamic_bg {
+            if dbg.mode() == 2 {
+                if let Ok(spectrum) = DynamicBackground::decode_audio(&music_bytes) {
+                    dbg.set_audio(spectrum);
+                }
+            }
+        }
+        let track_length = TRACK_LENGTH_OVERRIDE.with(|o| o.borrow().unwrap_or_else(|| music.length()));
         let buffer_size = Some(BUFFER_SIZE);
         let sfx_click = audio.create_sfx(res_pack.sfx_click.clone(), buffer_size)?;
         let sfx_drag = audio.create_sfx(res_pack.sfx_drag.clone(), buffer_size)?;
@@ -542,6 +574,7 @@ impl Resource {
 
             background,
             illustration,
+            dynamic_bg,
             icons: Self::load_icons().await?,
             mod_icons: Self::load_mod_icons().await?,
             res_pack,
@@ -567,6 +600,7 @@ impl Resource {
             note_buffer: RefCell::new(NoteBuffer::default()),
 
             model_stack: vec![Matrix::identity()],
+
         })
     }
 

@@ -19,7 +19,7 @@ use prpr::{
     scene::{return_file, show_error, show_message, take_file, NextScene, Scene},
     task::Task,
     time::TimeManager,
-    ui::{button_hit, Dialog, FontArc, RectButton, Ui, UI_AUDIO},
+    ui::{button_hit, Dialog, FontArc, PREFER_ALT_UI, RectButton, Ui, UI_AUDIO},
 };
 use sasa::{AudioClip, Music};
 use std::{
@@ -64,6 +64,9 @@ pub struct MainScene {
 
     pages: Vec<Box<dyn Page>>,
 
+    /// 是否为启动阶段（由 BootScene 接管音频，BGM 由 `start_boot_bgm` 控制）
+    boot: bool,
+
     import_task: Option<Task<Result<(LocalChart, ParseWarnings)>>>,
 
     mp_btn: RectButton,
@@ -93,7 +96,7 @@ impl MainScene {
         Self::init().await?;
 
         let bgm = {
-            match AudioClip::new(load_file("bgm.mp3").await?) {
+            match AudioClip::new(prpr::theme::load_asset_file("bgm.mp3").await?) {
                 Ok(clip) => Some(UI_AUDIO.with(|it| {
                     it.borrow_mut().create_music(
                         clip,
@@ -121,7 +124,7 @@ impl MainScene {
         // init button hitsound
         macro_rules! load_sfx {
             ($name:ident, $path:literal) => {{
-                let clip = AudioClip::new(load_file($path).await?)?;
+                let clip = AudioClip::new(prpr::theme::load_asset_file($path).await?)?;
                 let sound = UI_AUDIO.with(|it| it.borrow_mut().create_sfx(clip, None))?;
                 prpr::ui::$name.with(|it| *it.borrow_mut() = Some(sound));
             }};
@@ -130,7 +133,29 @@ impl MainScene {
         load_sfx!(UI_BTN_HITSOUND, "button.ogg");
         load_sfx!(UI_SWITCH_SOUND, "switch.ogg");
 
-        let background: SafeTexture = load_texture("background.jpg").await?.into();
+        // 主题音频挂载点：进入谱面库 / 进入谱面预览 / 开始游玩（文件缺失时静默跳过，不影响启动）
+        macro_rules! load_optional_sfx {
+            ($name:ident, $path:literal) => {{
+                if let Ok(bytes) = prpr::theme::load_asset_file($path).await {
+                    if let Ok(clip) = AudioClip::new(bytes) {
+                        if let Ok(sound) = UI_AUDIO.with(|it| it.borrow_mut().create_sfx(clip, None)) {
+                            prpr::ui::$name.with(|it| *it.borrow_mut() = Some(sound));
+                        }
+                    }
+                }
+            }};
+        }
+        load_optional_sfx!(UI_SFX_ENTER_LIBRARY, "enterlibrary.ogg");
+        load_optional_sfx!(UI_SFX_CHART_PREVIEW, "chartpreview.ogg");
+        load_optional_sfx!(UI_SFX_START_PLAYING, "startplaying.ogg");
+        load_optional_sfx!(UI_SFX_ENTER_SPLASH, "entersplash.ogg");
+        load_optional_sfx!(UI_SFX_TRACK_SKIP, "trackskip.ogg");
+        load_optional_sfx!(UI_SFX_ENTER, "enter.ogg");
+        load_optional_sfx!(UI_SFX_TOAST_OK, "toast_ok.ogg");
+        load_optional_sfx!(UI_SFX_TOAST_WARNING, "toast_warning.ogg");
+        load_optional_sfx!(UI_SFX_TOAST_ERROR, "toast_error.ogg");
+
+        let background: SafeTexture = prpr::theme::load_asset_texture("background.jpg").await?.into();
         let icon_back: SafeTexture = load_texture("back.png").await?.into();
 
         TEX_BACKGROUND.with(|it| *it.borrow_mut() = Some(background));
@@ -153,6 +178,8 @@ impl MainScene {
             icon_back: TEX_ICON_BACK.with(|it| it.borrow().clone().unwrap()),
 
             pages: Vec::new(),
+
+            boot: true,
 
             import_task: None,
 
@@ -189,6 +216,20 @@ impl MainScene {
     pub fn take_imported_respack() -> Option<ResPackItem> {
         RESPACK_ITEM.with(|it| it.borrow_mut().take())
     }
+
+    /// 启动阶段由 BootScene 在点击时调用：主界面 BGM 在给定秒数内渐入至最大。
+    pub(crate) fn start_boot_bgm(&mut self, fade_time: f64) {
+        if let Some(bgm) = &mut self.bgm {
+            let _ = bgm.fade_in(fade_time);
+        }
+    }
+
+    /// 暂停/恢复主页背景音乐（新手教程等覆盖场景使用）。
+    pub fn set_bgm_paused(&mut self, paused: bool) {
+        if let Some(bgm) = &mut self.bgm {
+            let _ = if paused { bgm.pause() } else { bgm.play() };
+        }
+    }
 }
 
 impl Scene for MainScene {
@@ -197,11 +238,30 @@ impl Scene for MainScene {
     }
 
     fn enter(&mut self, tm: &mut TimeManager, _target: Option<RenderTarget>) -> Result<()> {
-        if let Some(bgm) = &mut self.bgm {
+        if self.boot {
+            // 启动阶段：BGM 已由 BootScene 的 start_boot_bgm 控制，不再自动播放
+            self.boot = false;
+        } else if let Some(bgm) = &mut self.bgm {
             let _ = bgm.fade_in(1.3);
         }
         self.state.update(tm);
         self.pages.last_mut().unwrap().enter(&mut self.state)?;
+        #[cfg(feature = "intest")]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static SHOWN: AtomicBool = AtomicBool::new(false);
+            if !SHOWN.swap(true, Ordering::SeqCst) {
+                Dialog::plain(
+                    "该版本为内部测试版本",
+                    concat!(
+                        "当前版本的Phira-Firefly（",
+                        env!("CARGO_PKG_VERSION"),
+                        "）为内部测试版本，可能存在一定问题，严禁对外传播，如有发现将会受到处罚，包括但不限于被踢出内测群聊并加入黑名单等"
+                    ),
+                )
+                .show();
+            }
+        }
         MP_PANEL.with(|it| {
             if let Some(panel) = it.borrow_mut().as_mut() {
                 panel.enter();
@@ -294,6 +354,25 @@ impl Scene for MainScene {
     }
 
     fn update(&mut self, tm: &mut TimeManager) -> Result<()> {
+        if prpr::gamepad::take_multilang_pressed() && get_data().config.mp_enabled {
+            MP_PANEL.with(|it| {
+                if let Some(panel) = it.borrow_mut().as_mut() {
+                    panel.show(tm.real_time() as _);
+                }
+            });
+        }
+
+        // Handle gamepad B-key back within MainScene pages
+        if prpr::gamepad::take_back_pressed() && self.pages.len() > 1 && !self.state.fader.transiting() {
+            if !self.pages.last_mut().unwrap().on_back_pressed(&mut self.state) {
+                if self.pages.len() == 2 {
+                    if let Some(bgm) = &mut self.bgm {
+                        bgm.set_low_pass(0.)?;
+                    }
+                }
+                self.pop();
+            }
+        }
         UI_AUDIO.with(|it| it.borrow_mut().recover_if_needed())?;
         if get_data().config.mp_enabled {
             MP_PANEL.with(|it| {
@@ -419,7 +498,7 @@ impl Scene for MainScene {
                 "_import_respack" => {
                     let root = dir::respacks()?;
                     let dir = prpr::dir::Dir::new(&root)?;
-                    let mut dir_id = String::new();
+                    let mut dir_id: Option<String> = None;
                     let item: Result<ResPackItem> = (|| {
                         let config = {
                             let mut zip = zip::ZipArchive::new(BufReader::new(File::open(&file)?))?;
@@ -464,23 +543,35 @@ impl Scene for MainScene {
                         while dir.exists(uuid.to_string())? {
                             uuid = Uuid::new_v4();
                         }
-                        dir_id = uuid.to_string();
-                        dir.create_dir_all(&dir_id)?;
-                        let dir = dir.open_dir(&dir_id)?;
+                        let id = uuid.to_string();
+                        dir.create_dir_all(&id)?;
+                        let dir = dir.open_dir(&id)?;
+                        dir_id = Some(id.clone());
                         unzip_into(BufReader::new(File::open(file)?), &dir, false).context("failed to unzip")?;
-                        get_data_mut().respacks.push(dir_id.clone());
+                        get_data_mut().respacks.push(id.clone());
                         save_data()?;
-                        Ok(ResPackItem::new(Some(format!("{root}/{dir_id}").into()), config.name))
+                        Ok(ResPackItem::new(Some(format!("{root}/{id}").into()), config.name))
                     })();
                     match item {
                         Err(err) => {
-                            dir.remove_dir_all(&dir_id)?;
                             show_error(err.context(itl!("import-respack-failed")));
+                            if let Some(id) = &dir_id {
+                                dir.remove_dir_all(id)?;
+                            }
                         }
                         Ok(item) => {
                             RESPACK_ITEM.with(|it| *it.borrow_mut() = Some(item));
                             show_message(itl!("import-respack-success"));
                         }
+                    }
+                }
+                "_import_theme" => {
+                    match crate::theme::import_theme_from_zip(file) {
+                        Ok(name) => {
+                            crate::theme::THEME_IMPORTED.store(true, Ordering::Relaxed);
+                            show_message(itl!("import-theme-success", "name" => name)).ok();
+                        }
+                        Err(err) => show_error(err.context(itl!("import-theme-failed"))),
                     }
                 }
                 _ => return_file(id, file),
@@ -634,8 +725,40 @@ impl Scene for MainScene {
         ui.fill_rect(ui.screen_rect(), (*self.background, ui.screen_rect()));
         gl_use_default_material();
 
+        // XCHS UI: plum tint + pink top ribbon + scattered hearts over every page
+        if PREFER_ALT_UI.load(Ordering::Relaxed) {
+            let top = ui.top;
+            ui.fill_rect(ui.screen_rect(), Color::new(0.133, 0.071, 0.137, 0.92));
+            ui.fill_rect(Rect::new(-1., -top, 2., 0.155), Color::new(1.0, 0.58, 0.706, 0.08));
+            ui.fill_rect(Rect::new(-1., top - 0.06, 2., 0.06), Color::new(0.10, 0.05, 0.09, 0.6));
+            for i in 0..8 {
+                ui.text("\u{2665}")
+                    .pos(-0.9 + i as f32 * 0.27, -top + 0.05)
+                    .anchor(0.5, 0.5)
+                    .no_baseline()
+                    .size(0.28)
+                    .color(Color::new(1.0, 0.776, 0.847, 0.12))
+                    .draw();
+            }
+            for i in 0..5 {
+                ui.text("\u{2665}")
+                    .pos(-0.85 + i as f32 * 0.42, top - 0.035)
+                    .anchor(0.5, 0.5)
+                    .no_baseline()
+                    .size(0.22)
+                    .color(Color::new(1.0, 0.776, 0.847, 0.08))
+                    .draw();
+            }
+        }
+
         let s = &mut self.state;
         s.update(tm);
+
+        // 启动入场整体渐显（Out Sine, 1s）
+        let entry_p = crate::scene::boot::boot_entry_progress(s.t, 1.0);
+        let entry_alpha = (entry_p * std::f32::consts::PI / 2.).sin();
+        let old_entry_alpha = ui.alpha;
+        ui.alpha = old_entry_alpha * entry_alpha;
 
         // 1. page
         if s.fader.transiting() {
@@ -651,25 +774,30 @@ impl Scene for MainScene {
         s.fader.sub = false;
 
         // 2. title
-        if s.fader.transiting() {
-            let pos = self.pages.len() - 2;
-            s.fader.reset();
-            s.fader.render_title(ui, s.t, &self.pages[pos].label());
+        if !PREFER_ALT_UI.load(Ordering::Relaxed) {
+            if s.fader.transiting() {
+                let pos = self.pages.len() - 2;
+                s.fader.reset();
+                s.fader.render_title(ui, s.t, &self.pages[pos].label());
+            }
+            s.fader.for_sub(|f| f.render_title(ui, s.t, &self.pages.last().unwrap().label()));
         }
-        s.fader.for_sub(|f| f.render_title(ui, s.t, &self.pages.last().unwrap().label()));
 
         // 3. back
         if self.pages.len() >= 2 {
+            let xchs = PREFER_ALT_UI.load(Ordering::Relaxed);
             let mut r = ui.back_rect();
             self.btn_back.set(ui, r);
-            ui.scissor(r, |ui| {
-                r.y += match self.pages.len() {
-                    1 => 1.,
-                    2 => s.fader.for_sub(|f| f.progress(s.t)),
-                    _ => 0.,
-                } * r.h;
-                ui.fill_rect(r, (*self.icon_back, r));
-            });
+            if !xchs {
+                ui.scissor(r, |ui| {
+                    r.y += match self.pages.len() {
+                        1 => 1.,
+                        2 => s.fader.for_sub(|f| f.progress(s.t)),
+                        _ => 0.,
+                    } * r.h;
+                    ui.fill_rect(r, (*self.icon_back, r));
+                });
+            }
         }
 
         self.pages.last_mut().unwrap().render_top(ui, s)?;
@@ -683,6 +811,11 @@ impl Scene for MainScene {
             self.mp_btn.set(ui, r);
             let r = r.feather(-0.02);
             ui.fill_rect(r, (*self.mp_icon, r));
+
+            if prpr::gamepad::is_connected() {
+                let focus_rect = Rect::new(self.mp_btn_pos.x - r.w / 2., self.mp_btn_pos.y - r.h / 2., r.w, r.h);
+                prpr::ui::register_focus_target(focus_rect, prpr::ui::FocusType::Button, "mp_panel_toggle");
+            }
 
             MP_PANEL.with(|it| {
                 if let Some(panel) = it.borrow_mut().as_mut() {
@@ -700,6 +833,7 @@ impl Scene for MainScene {
             ui.full_loading(itl!("batch-importing", "current" => current, "total" => total), s.t);
         }
 
+        ui.alpha = old_entry_alpha;
         Ok(())
     }
 

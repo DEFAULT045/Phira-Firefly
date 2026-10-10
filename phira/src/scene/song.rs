@@ -42,7 +42,7 @@ use prpr::{
     },
     fs::{self},
     info::ChartInfo,
-    judge::{icon_index, Judge},
+    judge::{icon_index, icon_index_xcsim, Judge},
     scene::{
         request_file, request_input, return_file, return_input, show_error, show_message, take_file, take_input, BasicPlayer, GameMode, LoadingScene,
         LocalSceneTask, NextScene, RecordUpdateState, SaveFn, Scene, SimpleRecord, UpdateFn, UploadFn,
@@ -142,6 +142,21 @@ fn fade_in_time() -> Option<f32> {
     } else {
         Some(0.3)
     }
+}
+
+/// 按纹理原始宽高比在矩形内等比缩小（contain），避免 `ScaleType::Fit` 将非方形图拉伸变形。
+fn contain_rect(tex: &Texture2D, r: Rect) -> Rect {
+    let (tw, th) = (tex.width() as f32, tex.height() as f32);
+    if tw <= 0. || th <= 0. {
+        return r;
+    }
+    let ratio = tw / th;
+    let (w, h) = if r.w / r.h > ratio {
+        (r.h * ratio, r.h)
+    } else {
+        (r.w, r.w / ratio)
+    };
+    Rect::new(r.x + (r.w - w) / 2., r.y + (r.h - h) / 2., w, h)
 }
 
 fn edit_transit() -> Option<f32> {
@@ -316,6 +331,7 @@ pub struct SongScene {
     entity: Option<Chart>,
     info: BriefChartInfo,
     local_path: Option<String>,
+    xcsim: bool,
 
     downloading: Option<Downloading>,
     loading_last: f32,
@@ -387,6 +403,11 @@ pub struct SongScene {
 
     uploader_btn: RectButton,
 
+    // XC-SIM 上传者信息（从 XC-SIM 服务器获取，与 Phira 的 UserManager 无关）。
+    xcsim_uploader_name: Option<String>,
+    xcsim_uploader_avatar: Option<SafeTexture>,
+    xcsim_uploader_task: Option<Task<Result<Option<(String, Option<image::DynamicImage>)>>>>,
+
     sf: SFader,
     fade_start: f32,
 
@@ -412,13 +433,61 @@ pub struct SongScene {
     autocomplete_task: Option<Task<Result<String>>>,
 
     export_task: Option<mpsc::Receiver<Result<()>>>,
+
+    /// 局域网联机管理器
+    #[cfg(feature = "testing")]
+    lan_manager: Option<Arc<Mutex<crate::lan::LanManager>>>,
+    /// 局域网联机面板
+    #[cfg(feature = "testing")]
+    lan_panel: Option<crate::lan::LanPanel>,
+    /// 是否由局域网联机发起的游玩（结束返回时重新打开联机面板）
+    #[cfg(feature = "testing")]
+    lan_game: bool,
+    /// 是否已由联机触发过一次开始（防止重复触发）
+    #[cfg(feature = "testing")]
+    lan_launched: bool,
+    /// 成员端：从房主下载谱面的任务
+    #[cfg(feature = "testing")]
+    lan_download_task: Option<Task<Result<LocalTuple>>>,
+    /// 成员端：已下载完成的谱面（等待所有人同步后开始）
+    #[cfg(feature = "testing")]
+    lan_loaded_tuple: Option<LocalTuple>,
+    /// 房主端：是否在等待所有成员同步就绪
+    #[cfg(feature = "testing")]
+    lan_host_waiting: bool,
+    /// 房主端：房主自己是否已就绪（谱面准备完成）
+    #[cfg(feature = "testing")]
+    lan_host_ready: bool,
+    /// 成员端：是否已点“准备”
+    #[cfg(feature = "testing")]
+    lan_ready: bool,
+    /// 成员端：准备按钮
+    #[cfg(feature = "testing")]
+    lan_ready_btn: DRectButton,
 }
 
 impl SongScene {
     pub fn new(mut chart: ChartItem, local_path: Option<String>, icons: Arc<Icons>, rank_icons: [SafeTexture; 8], mods: Mods) -> Self {
+        // 从 local_path 自动识别 XC-SIM 谱面（存储在 `xcsim/` 目录下），
+        // 这样即使在本地分区打开 XC-SIM 谱面也会按 XC-SIM 规则游玩。
+        let xcsim = local_path.as_deref().map_or(false, |p| p.starts_with("xcsim/"));
+        Self::new_xcsim(chart, local_path, icons, rank_icons, mods, xcsim)
+    }
+
+    /// Same as [`SongScene::new`], but fetch the chart from the XC-SIM server.
+    pub fn new_xcsim(mut chart: ChartItem, local_path: Option<String>, icons: Arc<Icons>, rank_icons: [SafeTexture; 8], mods: Mods, xcsim: bool) -> Self {
         if let Some(path) = &local_path {
-            if let Some(id) = path.strip_prefix("download/") {
-                chart.info.id = Some(id.parse().unwrap());
+            // XC-SIM 谱面在 `xcsim/` 目录下，官方谱面在 `download/` 目录下。
+            if let Some(id) = path
+                .strip_prefix("xcsim/")
+                .or_else(|| path.strip_prefix("download/xcsim/"))
+                .or_else(|| path.strip_prefix("download/"))
+            {
+                // 仅当后缀为数字 id 时才设置在线 id。
+                // 联机下载的谱面路径为 download/{uuid}（UUID 非数字），不应解析为在线 id。
+                if let Ok(id) = id.parse::<i32>() {
+                    chart.info.id = Some(id);
+                }
             }
         }
         let illu = if let Some(path) = &chart.local_path {
@@ -430,8 +499,13 @@ impl SongScene {
                 texture: chart.illu.texture.clone(),
                 notify: Arc::default(),
                 task: Some(Task::new({
+                    let xcsim = xcsim;
                     async move {
-                        let chart = Ptr::<Chart>::new(id).load().await?;
+                        let chart = if xcsim {
+                            crate::client::xcsim::get_chart(id).await?.ok_or_else(|| Error::msg("chart not found"))?
+                        } else {
+                            Ptr::<Chart>::new(id).load().await?
+                        };
                         let image = chart.illustration.load_image().await?;
                         Ok((image, None))
                     }
@@ -448,7 +522,7 @@ impl SongScene {
             .find(|it| Some(&it.local_path) == local_path.as_ref())
             .and_then(|it| it.record.clone())
             .or_else(|| local_path.as_ref().and_then(|path| get_data().local_records.get(path).cloned().flatten()));
-        let fetch_best_task = if get_data().me.is_some() {
+        let fetch_best_task = if get_data().me.is_some() && !xcsim {
             chart.info.id.map(|id| Task::new(Client::best_record(id)))
         } else {
             None
@@ -456,6 +530,27 @@ impl SongScene {
         let id = chart.info.id;
         let offline_mode = get_data().config.offline_mode;
         let icon_star = icons.star.clone();
+        // XC-SIM 上传者信息从 XC-SIM 服务器获取（GET /user/{id}），同时拉取头像。
+        let xcsim_uploader_task = if xcsim {
+            chart.info.uploader.as_ref().map(|u| {
+                let uid = u.id;
+                Task::new(async move {
+                    let user = crate::client::xcsim::get_user(uid).await?;
+                    let user = match user {
+                        Some(user) => user,
+                        None => return Ok(None),
+                    };
+                    let name = user.name;
+                    let avatar = match &user.avatar {
+                        Some(avatar) => image::load_from_memory(&avatar.fetch().await?).ok(),
+                        None => None,
+                    };
+                    Ok(Some((name, avatar)))
+                })
+            })
+        } else {
+            None
+        };
         Self {
             illu,
 
@@ -471,6 +566,7 @@ impl SongScene {
             preview: None,
             preview_task: Some(Task::new({
                 let local_path = local_path.clone();
+                let xcsim = xcsim;
                 async move {
                     if let Some(path) = local_path {
                         let mut fs = fs_from_path(&path)?;
@@ -480,7 +576,11 @@ impl SongScene {
                             Some((info.preview_start, info.preview_end.unwrap_or(info.preview_start + 15.))),
                         )
                     } else {
-                        let chart = Ptr::<Chart>::new(id.unwrap()).fetch().await?;
+                        let chart = if xcsim {
+                            crate::client::xcsim::get_chart(id.unwrap()).await?.ok_or_else(|| Error::msg("chart not found"))?
+                        } else {
+                            Ptr::<Chart>::new(id.unwrap()).fetch().await?
+                        };
                         with_effects(AudioClip::decode(chart.preview.fetch().await?.to_vec())?, None)
                     }
                 }
@@ -488,12 +588,15 @@ impl SongScene {
 
             load_task: if offline_mode {
                 None
+            } else if xcsim {
+                id.map(|it| Task::new(async move { crate::client::xcsim::get_chart(it).await }))
             } else {
                 id.map(|it| Task::new(async move { Ptr::new(it).fetch_opt().await }))
             },
             entity: None,
             info: chart.info,
             local_path,
+            xcsim,
 
             downloading: None,
             loading_last: 0.,
@@ -553,7 +656,8 @@ impl SongScene {
 
             should_update: Arc::default(),
 
-            my_rating_task: if offline_mode {
+            my_rating_task: if offline_mode || xcsim {
+                // XC-SIM 谱面不能评分，不拉取评分状态。
                 None
             } else {
                 id.map(|id| {
@@ -577,6 +681,10 @@ impl SongScene {
             scene_task: None,
 
             uploader_btn: RectButton::new(),
+
+            xcsim_uploader_name: None,
+            xcsim_uploader_avatar: None,
+            xcsim_uploader_task,
 
             sf: SFader::new(),
             fade_start: 0.,
@@ -602,6 +710,27 @@ impl SongScene {
             autocomplete_task: None,
 
             export_task: None,
+
+            #[cfg(feature = "testing")]
+            lan_manager: Some(Arc::new(Mutex::new(crate::lan::LanManager::new()))),
+            #[cfg(feature = "testing")]
+            lan_panel: None,
+            #[cfg(feature = "testing")]
+            lan_game: false,
+            #[cfg(feature = "testing")]
+            lan_launched: false,
+            #[cfg(feature = "testing")]
+            lan_download_task: None,
+            #[cfg(feature = "testing")]
+            lan_loaded_tuple: None,
+            #[cfg(feature = "testing")]
+            lan_host_waiting: false,
+            #[cfg(feature = "testing")]
+            lan_host_ready: false,
+            #[cfg(feature = "testing")]
+            lan_ready: false,
+            #[cfg(feature = "testing")]
+            lan_ready_btn: DRectButton::new(),
         }
     }
 
@@ -612,16 +741,27 @@ impl SongScene {
             return Ok(());
         };
         self.loading_last = 0.;
-        self.downloading = Some(Self::global_start_download(chart, entity, self.local_path.clone())?);
+        self.downloading = Some(Self::global_start_download(chart, entity, self.local_path.clone(), self.xcsim)?);
         Ok(())
     }
 
-    pub fn global_start_download(chart: BriefChartInfo, entity: Chart, local_path: Option<String>) -> Result<Downloading> {
+    pub fn global_start_download(chart: BriefChartInfo, entity: Chart, local_path: Option<String>, xcsim: bool) -> Result<Downloading> {
         let progress = Arc::new(Mutex::new(None));
         let prog_wk = Arc::downgrade(&progress);
         let status = Arc::new(Mutex::new(tl!("dl-status-fetch")));
         let status_shared = Arc::clone(&status);
         let atomicity = Arc::new(Mutex::new(()));
+        let download_token = if xcsim {
+            if let Some(token) = crate::client::xcsim::XC_SIM_CLIENT_TOKEN.load().as_ref() {
+                Some(token.clone())
+            } else {
+                None
+            }
+        } else if let Some(token) = CLIENT_TOKEN.load().as_ref() {
+            Some(token.clone())
+        } else {
+            None
+        };
         Ok(Downloading {
             info: chart.clone(),
             local_path,
@@ -638,11 +778,12 @@ impl SongScene {
                     let dir = prpr::dir::Dir::new(path)?;
 
                     let chart = chart;
-                    async fn download(mut file: impl Write, url: &str, prog_wk: &Weak<Mutex<Option<f32>>>) -> Result<()> {
+                    let download_token = download_token;
+                    async fn download(mut file: impl Write, url: &str, token: Option<String>, prog_wk: &Weak<Mutex<Option<f32>>>) -> Result<()> {
                         let Some(prog) = prog_wk.upgrade() else { return Ok(()) };
                         *prog.lock().unwrap() = None;
                         let req = basic_client_builder().build().unwrap().get(url);
-                        let req = if let Some(token) = CLIENT_TOKEN.load().as_ref() {
+                        let req = if let Some(token) = token {
                             req.header("Authorization", format!("Bearer {token}"))
                         } else {
                             req
@@ -668,7 +809,7 @@ impl SongScene {
 
                     *status.lock().unwrap() = tl!("dl-status-chart");
                     let mut bytes = Vec::new();
-                    download(Cursor::new(&mut bytes), &entity.file.url, &prog_wk).await?;
+                    download(Cursor::new(&mut bytes), &entity.file.url, download_token.clone(), &prog_wk).await?;
                     *status.lock().unwrap() = tl!("dl-status-extract");
                     if prog_wk.strong_count() != 0 {
                         unzip_into(Cursor::new(bytes), &dir, false)?;
@@ -691,11 +832,20 @@ impl SongScene {
                         tokio::fs::remove_dir_all(&path).await?;
                     }
 
-                    let local_path = format!("download/{}", chart.id.unwrap());
+                    // XC-SIM 谱面存到独立目录 data/charts/xcsim，与官方同 ID 谱面区分开。
+                    let local_path = if xcsim {
+                        format!("xcsim/{}", chart.id.unwrap())
+                    } else {
+                        format!("download/{}", chart.id.unwrap())
+                    };
                     let to_path = format!("{}/{local_path}", dir::charts()?);
                     let to_path = Path::new(&to_path);
                     {
                         let _guard = atomicity.lock().unwrap();
+                        // 确保父目录存在，否则重命名会报 os error 3（找不到路径）。
+                        if let Some(parent) = to_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
                         if to_path.exists() {
                             if to_path.is_file() {
                                 std::fs::remove_file(to_path)?;
@@ -724,7 +874,8 @@ impl SongScene {
     }
 
     fn load_ldb(&mut self) {
-        if get_data().config.offline_mode {
+        // XC-SIM 谱面不参与排行榜。
+        if get_data().config.offline_mode || self.xcsim {
             return;
         }
         let Some(id) = self.info.id else { return };
@@ -774,7 +925,8 @@ impl SongScene {
         if self.local_path.as_ref().is_some_and(|it| !it.starts_with(':')) {
             self.menu_options.push("delete");
         }
-        if self.info.id.is_some() {
+        // XC-SIM 谱面不能评分。
+        if self.info.id.is_some() && !self.xcsim {
             self.menu_options.push("rate");
         }
         if let Some(local_path) = &self.local_path {
@@ -823,6 +975,11 @@ impl SongScene {
         }
         if self.local_path.as_ref().is_some_and(|it| !it.starts_with(':')) {
             self.menu_options.push("export");
+            #[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32", target_env = "ohos")))]
+            self.menu_options.push("render");
+            #[cfg(feature = "testing")]
+            // 局域网联机（仅已下载的本地谱面）
+            self.menu_options.push("lan-multiplayer");
         }
         self.menu.set_options(self.menu_options.iter().map(|it| tl!(*it).into_owned()).collect());
     }
@@ -837,8 +994,17 @@ impl SongScene {
                     .find(|it| it.local_path == *local_path)
                     .is_some_and(|it| it.info.has_unlock && !it.played_unlock));
 
-        self.scene_task =
-            Self::global_launch(self.info.id, local_path, self.mods, mode, None, Some(self.background.clone()), self.record.clone(), is_unlock)?;
+        self.scene_task = Self::global_launch(
+            self.info.id,
+            local_path,
+            self.mods,
+            mode,
+            None,
+            Some(self.background.clone()),
+            self.record.clone(),
+            is_unlock,
+            self.xcsim,
+        )?;
 
         Ok(())
     }
@@ -854,9 +1020,11 @@ impl SongScene {
         background_output: Option<Arc<Mutex<Option<SafeTexture>>>>,
         record: Option<SimpleRecord>,
         is_unlock: bool,
+        xcsim: bool,
     ) -> Result<LocalSceneTask> {
         let mut fs = fs_from_path(local_path)?;
         let can_rated = id.is_some() || local_path.starts_with(':');
+        let replay_local_path = local_path.to_owned();
         #[cfg(feature = "video")]
         let local_path = local_path.to_owned();
         #[cfg(closed)]
@@ -944,8 +1112,8 @@ impl SongScene {
                         }
                         judges.extend(judge.judgements.borrow_mut().drain(..).map(|it| JudgeEvent {
                             time: it.0 as f32,
-                            line_id: it.1,
-                            note_id: it.2,
+                            line_id: it.1 as i32,
+                            note_id: it.2 as i32,
                             judgement: {
                                 use phira_mp_common::Judgement::*;
                                 use prpr::judge::Judgement as OJ;
@@ -993,6 +1161,13 @@ impl SongScene {
             }
         }));
 
+        // Persist auto-recorded replays to data/replays/<ts>_<chart>.json.
+        let record_save_fn: Option<prpr::replay::RecordSaveFn> = Some(Arc::new(|data| {
+            let dir = std::path::PathBuf::from(crate::dir::replays()?);
+            prpr::replay::save_replay_to_dir(&dir, &data)?;
+            Ok(())
+        }));
+
         Ok(Some(Box::pin(async move {
             let mut info = fs::load_info(fs.as_mut()).await?;
             info.id = id;
@@ -1023,48 +1198,29 @@ impl SongScene {
                 historic_best: record.map_or(0, |it| it.score as u32),
             });
             let upload_fn: Option<UploadFn> = Some(Arc::new(move |data: Vec<u8>| {
+                // 完全绕开原版的 /play/upload 成绩上传（诊断用：判断是否与安卓连接冲突）
+                let _ = data;
                 Task::new(async move {
-                    #[derive(Serialize)]
-                    #[serde(rename_all = "camelCase")]
-                    struct Req {
-                        chart: i32,
-                        token: String,
-                        chart_updated: Option<DateTime<Utc>>,
-                    }
-                    #[derive(Deserialize)]
-                    #[serde(rename_all = "camelCase")]
-                    struct Resp {
-                        id: i32,
-                        exp_delta: f64,
-                        new_best: bool,
-                        improvement: u32,
-                        new_rks: f32,
-                    }
-                    let resp: Resp = recv_raw(Client::post(
-                        "/play/upload",
-                        &Req {
-                            chart: id.unwrap(),
-                            token: STANDARD.encode(data),
-                            chart_updated,
-                        },
-                    ))
-                    .await?
-                    .json()
-                    .await?;
-                    RECORD_ID.store(resp.id, Ordering::Relaxed);
                     Ok(RecordUpdateState {
-                        best: resp.new_best,
-                        improvement: resp.improvement,
-                        gain_exp: resp.exp_delta as f32,
-                        new_rks: Some(resp.new_rks),
+                        best: false,
+                        improvement: 0,
+                        gain_exp: 0.,
+                        new_rks: None,
                     })
                 })
             }));
+            let replay_handoff = if get_data().config.auto_record && mode == GameMode::Normal {
+                Some(prpr::replay::ReplayHandoff::Record {
+                    chart_local_path: replay_local_path,
+                })
+            } else {
+                None
+            };
             if is_unlock {
                 #[cfg(not(feature = "video"))]
                 {
                     warn!("this build does not support unlock video.");
-                    LoadingScene::new(mode, info, config, fs, player, upload_fn, update_fn, save_fn, Some(preload))
+                    LoadingScene::new(mode, info, config, fs, player, upload_fn, update_fn, save_fn, xcsim, record_save_fn, replay_handoff, Some(preload))
                         .await
                         .map(|it| NextScene::Overlay(Box::new(it)))
                 }
@@ -1076,12 +1232,12 @@ impl SongScene {
                         save_data()?;
                     }
 
-                    UnlockScene::new(mode, info, config, fs, player, upload_fn, update_fn, save_fn, Some(preload))
+                    UnlockScene::new(mode, info, config, fs, player, upload_fn, update_fn, save_fn, record_save_fn, replay_handoff, Some(preload))
                         .await
                         .map(|it| NextScene::Overlay(Box::new(it)))
                 }
             } else {
-                LoadingScene::new(mode, info, config, fs, player, upload_fn, update_fn, save_fn, Some(preload))
+                LoadingScene::new(mode, info, config, fs, player, upload_fn, update_fn, save_fn, xcsim, record_save_fn, replay_handoff, Some(preload))
                     .await
                     .map(|it| NextScene::Overlay(Box::new(it)))
             }
@@ -1190,14 +1346,26 @@ impl SongScene {
         let pad = 0.03;
         let width = self.side_content.width() - pad;
         ui.dy(0.03);
-        self.ldb_type_btn.render_text(
-            ui,
-            Rect::new(width - 0.24, 0.01, 0.23, 0.08),
-            rt,
-            if self.ldb_std { tl!("ldb-std") } else { tl!("ldb-score") },
-            0.6,
-            true,
-        );
+        let xchs = prpr::ui::PREFER_ALT_UI.load(Ordering::Relaxed);
+        let ldb_type_label = if self.ldb_std { tl!("ldb-std") } else { tl!("ldb-score") };
+        if xchs {
+            // XCHS：评分/分数切换为粉色胶囊
+            let rr = Rect::new(width - 0.24, 0.01, 0.23, 0.08);
+            self.ldb_type_btn.render_shadow(ui, rr, rt, |ui, path| {
+                ui.fill_path(&path, Color::new(0.37, 0.185, 0.265, 0.99));
+                ui.stroke_path(&rr.feather(0.004).rounded(0.02), 0.0035, Color::new(1.0, 0.776, 0.847, 0.45));
+                ui.text(ldb_type_label.as_ref())
+                    .pos(rr.center().x, rr.center().y)
+                    .anchor(0.5, 0.5)
+                    .no_baseline()
+                    .size(0.5)
+                    .max_width(rr.w - 0.02)
+                    .color(Color::new(0.984, 0.973, 0.886, 1.))
+                    .draw();
+            });
+        } else {
+            self.ldb_type_btn.render_text(ui, Rect::new(width - 0.24, 0.01, 0.23, 0.08), rt, ldb_type_label, 0.6, true);
+        }
         render_ldb(
             ui,
             &tl!("ldb"),
@@ -1228,6 +1396,10 @@ impl SongScene {
 
     fn side_info(&mut self, ui: &mut Ui, rt: f32) {
         let pad = 0.03;
+        let xchs = prpr::ui::PREFER_ALT_UI.load(Ordering::Relaxed);
+        let cream = Color::new(0.984, 0.973, 0.886, 1.);
+        let muted = Color::new(1.0, 0.776, 0.847, 0.62);
+        let border = Color::new(1.0, 0.776, 0.847, 0.45);
         ui.dx(pad);
         ui.dy(0.03);
         let width = self.side_content.width() - pad;
@@ -1242,7 +1414,8 @@ impl SongScene {
                 }};
             }
             let mw = width - pad * 3.;
-            if self.info.id.is_some() {
+            // XC-SIM 谱面不提供「在网站中打开」（其链接指向 phira.moe，对 XC-SIM 无效）。
+            if self.info.id.is_some() && !self.xcsim {
                 let r = Rect::new(0.03, 0., mw, 0.12).nonuniform_feather(-0.03, -0.01);
                 self.open_web_btn.render_text(ui, r, rt, ttl!("open-in-web"), 0.6, true);
                 dy!(r.h + 0.04);
@@ -1250,9 +1423,32 @@ impl SongScene {
             if let Some(uploader) = &self.info.uploader {
                 let c = 0.06;
                 let s = 0.05;
-                let r = ui.avatar(c, c, s, rt, UserManager::opt_avatar(uploader.id, &self.icons.user));
-                self.uploader_btn.set(ui, Rect::new(c - s, c - s, s * 2., s * 2.));
-                if let Some((name, color)) = UserManager::name_and_color(uploader.id) {
+                // XC-SIM 上传者头像从 XC-SIM 服务器获取（避免同 ID 撞到 Phira 用户头像）。
+                let r = ui.avatar(
+                    c,
+                    c,
+                    s,
+                    rt,
+                    if self.xcsim {
+                        match &self.xcsim_uploader_avatar {
+                            Some(tex) => Ok(Some(tex.clone())),
+                            None => Err(self.icons.user.clone()),
+                        }
+                    } else {
+                        UserManager::opt_avatar(uploader.id, &self.icons.user)
+                    },
+                );
+                // XC-SIM 上传者是 XC-SIM 账号，点击头像不做任何跳转。
+                if !self.xcsim {
+                    self.uploader_btn.set(ui, Rect::new(c - s, c - s, s * 2., s * 2.));
+                }
+                // XC-SIM 上传者名称从 XC-SIM 服务器获取。
+                let name_color: Option<(String, Color)> = if self.xcsim {
+                    self.xcsim_uploader_name.as_ref().map(|name| (name.clone(), semi_white(1.)))
+                } else {
+                    UserManager::name_and_color(uploader.id)
+                };
+                if let Some((name, color)) = name_color {
                     ui.text(name)
                         .pos(r.right() + 0.02, r.center().y)
                         .anchor(0., 0.5)
@@ -1293,8 +1489,17 @@ impl SongScene {
             }
 
             let mut item = |title: Cow<'_, str>, content: Cow<'_, str>| {
-                dy!(ui.text(title).size(0.4).color(semi_white(0.7)).draw().h + 0.02);
-                dy!(ui.text(content).pos(pad, 0.).size(0.6).multiline().max_width(mw).draw().h + 0.03);
+                dy!(ui.text(title).size(0.4).color(if xchs { muted } else { semi_white(0.7) }).draw().h + 0.02);
+                dy!(ui
+                    .text(content)
+                    .pos(pad, 0.)
+                    .size(0.6)
+                    .multiline()
+                    .max_width(mw)
+                    .color(if xchs { cream } else { WHITE })
+                    .draw()
+                    .h
+                    + 0.03);
             };
             item(tl!("info-name"), self.info.name.as_str().into());
             item(tl!("info-composer"), self.info.composer.as_str().into());
@@ -1302,9 +1507,14 @@ impl SongScene {
             item(tl!("info-difficulty"), format!("{} ({:.1})", self.info.level, self.info.difficulty).into());
             item(tl!("info-desc"), self.info.intro.as_str().into());
             if let Some(entity) = &self.entity {
-                item(tl!("info-rating"), entity.rating.map_or(Cow::Borrowed("NaN"), |r| format!("{:.2} / 5.00", r * 5.).into()));
-                item(
-                    tl!("info-type"),
+                // XC-SIM 谱面不显示评分信息。
+                if !self.xcsim {
+                    item(tl!("info-rating"), entity.rating.map_or(Cow::Borrowed("NaN"), |r| format!("{:.2} / 5.00", r * 5.).into()));
+                }
+                // XC-SIM 谱面的种类固定显示为「XC-SIM」。
+                let type_text = if self.xcsim {
+                    "XC-SIM".to_owned()
+                } else {
                     format!(
                         "{}{}",
                         if entity.reviewed { tl!("reviewed") } else { tl!("unreviewed") },
@@ -1314,12 +1524,45 @@ impl SongScene {
                             (false, _) => ttl!("chart-unstable"),
                         }
                     )
-                    .into(),
-                );
-                item(tl!("info-tags"), entity.tags.iter().map(|it| format!("#{it}")).join(" ").into());
+                };
+                item(tl!("info-type"), type_text.into());
+                if !xchs {
+                    item(tl!("info-tags"), entity.tags.iter().map(|it| format!("#{it}")).join(" ").into());
+                }
             }
             if let Some(id) = self.info.id {
                 item("ID".into(), id.to_string().into());
+            }
+            if xchs {
+                // XCHS：标签胶囊（官方皮肤仍使用文本行）
+                if let Some(entity) = &self.entity {
+                    if !entity.tags.is_empty() {
+                        dy!(ui.text(tl!("info-tags")).size(0.4).color(muted).draw().h + 0.02);
+                        let mut cx = pad;
+                        let mut row_h = 0.;
+                        for tag in &entity.tags {
+                            let label = format!("#{tag}");
+                            let tw = ui.text(label.as_str()).size(0.4).measure().w + 0.036;
+                            if cx > pad && cx + tw > mw + pad {
+                                dy!(row_h + 0.012);
+                                cx = pad;
+                            }
+                            let chip = Rect::new(cx, 0., tw, 0.055);
+                            ui.fill_path(&chip.rounded(0.0275), Color::new(0.949, 0.412, 0.580, 0.20));
+                            ui.stroke_path(&chip.rounded(0.0275), 0.003, border);
+                            ui.text(label.as_str())
+                                .pos(chip.center().x, chip.center().y)
+                                .anchor(0.5, 0.5)
+                                .no_baseline()
+                                .size(0.4)
+                                .color(cream)
+                                .draw();
+                            cx += tw + 0.02;
+                            row_h = 0.055;
+                        }
+                        dy!(row_h + 0.03);
+                    }
+                }
             }
             (width, h)
         });
@@ -1327,6 +1570,10 @@ impl SongScene {
 
     fn side_mods(&mut self, ui: &mut Ui, rt: f32) {
         let pad = 0.03;
+        let accent = Color::new(1.0, 0.58, 0.706, 1.);
+        let cream = Color::new(0.984, 0.973, 0.886, 1.);
+        let muted = Color::new(1.0, 0.776, 0.847, 0.62);
+        let xchs = prpr::ui::PREFER_ALT_UI.load(Ordering::Relaxed);
         ui.dx(pad);
         ui.dy(0.03);
         let width = self.side_content.width() - pad;
@@ -1341,7 +1588,8 @@ impl SongScene {
                     ui.dy(dy);
                 }};
             }
-            dy!(ui.text(tl!("mods")).size(0.9).draw_using(&BOLD_FONT).h + 0.02);
+            let mods_title = if xchs { format!("\u{2665} {}", tl!("mods")) } else { tl!("mods").into_owned() };
+            dy!(ui.text(mods_title).size(0.9).color(if xchs { cream } else { WHITE }).draw_using(&BOLD_FONT).h + 0.02);
             let rh = ITEM_HEIGHT * 3. / 5.;
             let rr = Rect::new(width - 0.24, (ITEM_HEIGHT - rh) / 2., 0.2, rh);
             let mut index = 0;
@@ -1365,15 +1613,21 @@ impl SongScene {
                         .size(SUBTITLE_SIZE)
                         .max_width(SUB_MAX_WIDTH)
                         .multiline()
-                        .color(semi_white(0.6))
+                        .color(if xchs { muted } else { semi_white(0.6) })
                         .draw();
-                    ui.text(title).pos(LEFT, (ITEM_HEIGHT - h) / 2.).no_baseline().size(TITLE_SIZE).draw();
+                    ui.text(title)
+                        .pos(LEFT, (ITEM_HEIGHT - h) / 2.)
+                        .no_baseline()
+                        .size(TITLE_SIZE)
+                        .color(if xchs { cream } else { WHITE })
+                        .draw();
                 } else {
                     ui.text(title)
                         .pos(LEFT, ITEM_HEIGHT / 2.)
                         .anchor(0., 0.5)
                         .no_baseline()
                         .size(TITLE_SIZE)
+                        .color(if xchs { cream } else { WHITE })
                         .draw();
                 }
                 if self.mod_btns.len() <= index {
@@ -1388,14 +1642,22 @@ impl SongScene {
                 let oh = rr.h;
                 btn.build(ui, rt, rr, |ui, path| {
                     let ct = rr.center();
-                    ui.fill_path(&path, if on { WHITE } else { ui.background() });
+                    ui.fill_path(&path, if on { if xchs { accent } else { WHITE } } else { ui.background() });
                     ui.text(if on { ttl!("switch-on") } else { ttl!("switch-off") })
                         .pos(ct.x, ct.y)
                         .anchor(0.5, 0.5)
                         .no_baseline()
                         .size(0.5 * (1. - (1. - rr.h / oh).powf(1.3)))
                         .max_width(rr.w)
-                        .color(if on { Color::new(0.3, 0.3, 0.3, 1.) } else { WHITE })
+                        .color(if on {
+                            if xchs {
+                                Color::new(0.16, 0.09, 0.13, 1.)
+                            } else {
+                                Color::new(0.3, 0.3, 0.3, 1.)
+                            }
+                        } else {
+                            WHITE
+                        })
                         .draw();
                 });
                 dy!(ITEM_HEIGHT);
@@ -1409,9 +1671,442 @@ impl SongScene {
             item(tl!("mods-rainbow"), Some(tl!("mods-rainbow-sub")), Mods::RAINBOW);
             item(tl!("mods-instant-death-ap"), Some(tl!("mods-instant-death-ap-sub")), Mods::INSTANT_DEATH_AP);
             item(tl!("mods-instant-death-fc"), Some(tl!("mods-instant-death-fc-sub")), Mods::INSTANT_DEATH_FC);
+            item(tl!("mods-health-bar"), Some(tl!("mods-health-bar-sub")), Mods::HEALTH_BAR);
             item(tl!("mods-no-shader"), Some(tl!("mods-no-shader-sub")), Mods::NO_SHADER);
             (width, h + 0.2)
         });
+    }
+
+    /// XCHS UI 布局：上栏（返回/品牌/收藏/信息/菜单）+ 左栏（插图卡 + 歌曲信息）
+    /// + 右栏（成绩、操作按钮、简介）。与官方布局完全独立，官方布局仍保留用于切换皮肤。
+    fn render_a1(&mut self, tm: &mut TimeManager, ui: &mut Ui) -> Result<()> {
+        set_camera(&ui.camera());
+        let t = tm.now() as f32;
+        let rt = tm.real_time() as f32;
+        let top = ui.top;
+
+        let pink = Color::new(1.0, 0.58, 0.706, 1.);
+        let pink_deep = Color::new(0.949, 0.412, 0.580, 1.);
+        let cream = Color::new(0.984, 0.973, 0.886, 1.);
+        let muted = Color::new(1.0, 0.776, 0.847, 0.62);
+        let panel_c = Color::new(0.10, 0.07, 0.12, 0.62);
+        let border_c = Color::new(1.0, 0.776, 0.847, 0.45);
+
+        ui.fill_rect(ui.screen_rect(), (*self.illu.texture.1, ui.screen_rect()));
+        ui.fill_rect(ui.screen_rect(), semi_black(0.62));
+
+        // ---------------- 上栏 ----------------
+        let bar_h = 0.13_f32;
+        let bar_y = -top;
+        let bar_cy = bar_y + bar_h * 0.5;
+
+        let back_r = Rect::new(-0.97, bar_y + 0.025, 0.22, bar_h - 0.05);
+        self.back_btn.set(ui, back_r);
+        ui.text("\u{2190}")
+            .pos(back_r.x + 0.02, bar_cy)
+            .anchor(0., 0.5)
+            .no_baseline()
+            .size(0.5)
+            .color(cream)
+            .draw();
+
+        // 中间：品牌 \ 曲名
+        let brand = "Phira-Firefly";
+        let wm = ui
+            .text(brand)
+            .pos(-0.08, bar_cy)
+            .anchor(1., 0.5)
+            .no_baseline()
+            .size(0.62)
+            .color(pink)
+            .draw();
+        let sep = ui
+            .text("\\")
+            .pos(wm.right() + 0.02, bar_cy)
+            .anchor(0., 0.5)
+            .no_baseline()
+            .size(0.62)
+            .color(semi_white(0.5))
+            .draw();
+        ui.text(&self.info.name)
+            .pos(sep.right() + 0.03, bar_cy)
+            .anchor(0., 0.5)
+            .no_baseline()
+            .size(0.5)
+            .max_width(0.6)
+            .color(cream)
+            .draw();
+
+        // 右侧：收藏 / 信息 / 菜单
+        let fav_r = Rect::new(0.60, bar_y + 0.02, 0.11, bar_h - 0.04);
+        self.fav_btn.set(ui, fav_r);
+        let is_fav = if let Some(fav) = self.is_fav {
+            fav
+        } else {
+            let chart_ref = self.to_bare_chart_ref();
+            let fav = get_data().collections().any(|col| col.charts.iter().any(|it| it == &chart_ref));
+            self.is_fav = Some(fav);
+            fav
+        };
+        let fav_icon = if is_fav { &self.icons.star } else { &self.icons.star_outline };
+        // 图标保持正方形，否则 ScaleType::Fit 会把星形压扁
+        let fs = fav_r.h.min(fav_r.w) * 0.78;
+        let fr = Rect::new(fav_r.center().x - fs / 2., fav_r.center().y - fs / 2., fs, fs);
+        ui.fill_rect(fr, (**fav_icon, fr, ScaleType::Fit));
+
+        let info_r = Rect::new(0.73, bar_y + 0.02, 0.11, bar_h - 0.04);
+        self.info_btn.set(ui, info_r);
+        ui.stroke_circle(info_r.center().x, bar_cy, 0.032, 0.005, cream);
+        ui.text("i")
+            .pos(info_r.center().x, bar_cy)
+            .anchor(0.5, 0.5)
+            .no_baseline()
+            .size(0.56)
+            .color(cream)
+            .draw();
+
+        let menu_r = Rect::new(0.86, bar_y + 0.02, 0.11, bar_h - 0.04);
+        self.menu_btn.set(ui, menu_r);
+        ui.text("\u{22ef}")
+            .pos(menu_r.center().x, bar_cy)
+            .anchor(0.5, 0.5)
+            .no_baseline()
+            .size(0.74)
+            .color(if self.menu_options.is_empty() { semi_white(0.4) } else { cream })
+            .draw();
+        if self.need_show_menu {
+            self.need_show_menu = false;
+            self.menu.set_bottom(true);
+            self.menu.set_selected(usize::MAX);
+            self.menu.show(ui, t, Rect::new(0.62, bar_y + bar_h + 0.02, 0.35, 0.5));
+        }
+
+        let alpha = fade_in_time().map_or(1., |tt| ((t - self.fade_start) / tt).clamp(-1., 0.) + 1.);
+        let score = self.record.as_ref().map(|it| it.score).unwrap_or_default();
+        let accuracy = self.record.as_ref().map(|it| it.accuracy).unwrap_or_default();
+        let grade = self.record.as_ref().map_or(0, |it| {
+            if self.xcsim {
+                icon_index_xcsim(score as _)
+            } else {
+                icon_index(score as _, it.full_combo)
+            }
+        });
+        let play_label = "Let's Start!";
+
+        ui.alpha::<Result<()>>(alpha, |ui| {
+            let content_y = bar_y + bar_h;
+
+            // ---------------- 左栏：插图卡 + 歌曲信息 ----------------
+            let card = Rect::new(-0.95, content_y + 0.02, 0.90, 0.40);
+            let crad = 0.022_f32;
+            ui.fill_path(&card.rounded(crad), (*self.illu.texture.1, card, ScaleType::CropCenter));
+            for i in 0..10 {
+                let f0 = i as f32 / 10.;
+                let f1 = (i + 1) as f32 / 10.;
+                ui.fill_rect(
+                    Rect::new(card.x + crad, card.bottom() - 0.18 + 0.18 * f0, card.w - 2. * crad, 0.18 * (f1 - f0) + 0.002),
+                    semi_black(0.78 * f1 * f1),
+                );
+            }
+            ui.text(&self.info.name)
+                .pos(card.x + 0.035, card.bottom() - 0.03)
+                .anchor(0., 1.)
+                .no_baseline()
+                .size(0.86)
+                .max_width(card.w - 0.07)
+                .color(WHITE)
+                .draw();
+
+            let sip = Rect::new(card.x, card.bottom() + 0.03, card.w, top - card.bottom() - 0.09);
+            ui.fill_path(&sip.rounded(0.016), panel_c);
+            ui.stroke_path(&sip.rounded(0.016), 0.003, border_c);
+            ui.text(format!("\u{2665} {}", self.info.level))
+                .pos(sip.x + 0.03, sip.y + 0.05)
+                .anchor(0., 0.5)
+                .no_baseline()
+                .size(0.5)
+                .color(pink)
+                .draw();
+            ui.fill_path(&Rect::new(sip.x + 0.03, sip.y + 0.078, 0.11, 0.005).rounded(0.0025), pink_deep);
+
+            let rows: [(Cow<str>, Cow<str>); 4] = [
+                (tl!("info-name"), self.info.name.as_str().into()),
+                (tl!("info-composer"), self.info.composer.as_str().into()),
+                (tl!("info-charter"), self.info.charter.as_str().into()),
+                (tl!("info-difficulty"), format!("{} ({:.1})", self.info.level, self.info.difficulty).into()),
+            ];
+            let lx = sip.x + 0.03;
+            let vx = sip.x + 0.20;
+            let mw = sip.w - 0.23;
+            let mut iy = sip.y + 0.115;
+            for (label, value) in &rows {
+                ui.text(label.as_ref())
+                    .pos(lx, iy + 0.018)
+                    .anchor(0., 0.5)
+                    .no_baseline()
+                    .size(0.34)
+                    .color(muted)
+                    .draw();
+                ui.text(value.as_ref())
+                    .pos(vx, iy + 0.018)
+                    .anchor(0., 0.5)
+                    .no_baseline()
+                    .size(0.38)
+                    .max_width(mw)
+                    .color(cream)
+                    .draw();
+                iy += 0.062;
+            }
+            ui.text(tl!("info-desc"))
+                .pos(lx, iy + 0.018)
+                .anchor(0., 0.5)
+                .no_baseline()
+                .size(0.34)
+                .color(muted)
+                .draw();
+            let desc_r = Rect::new(vx, iy, mw, sip.bottom() - iy - 0.02);
+            ui.scissor(desc_r, |ui| {
+                ui.text(&self.info.intro)
+                    .pos(vx, iy)
+                    .size(0.36)
+                    .multiline()
+                    .max_width(mw)
+                    .color(cream)
+                    .draw();
+            });
+
+            // ---------------- 右栏：成绩 + 操作 ----------------
+            let rcx = 0.02_f32;
+            let p_r = Rect::new(rcx, content_y + 0.04, 0.13, 0.13);
+            ui.fill_path(&p_r.rounded(0.03), pink);
+            ui.text("P")
+                .pos(p_r.center().x, p_r.center().y)
+                .anchor(0.5, 0.5)
+                .no_baseline()
+                .size(1.1)
+                .color(WHITE)
+                .draw();
+            let score_t = self.record.as_ref().map_or_else(|| tl!("ldb-no-rank").into_owned(), |it| format!("{:07}", it.score));
+            ui.text(score_t)
+                .pos(p_r.right() + 0.04, p_r.center().y)
+                .anchor(0., 0.5)
+                .no_baseline()
+                .size(1.5)
+                .color(WHITE)
+                .draw();
+
+            let g_r = Rect::new(rcx, p_r.bottom() + 0.035, 0.11, 0.11);
+            let g_draw = contain_rect(&self.rank_icons[grade], g_r);
+            ui.fill_rect(g_draw, (*self.rank_icons[grade], g_draw, ScaleType::Fit));
+            if self.record.is_some() {
+                ui.text(format!("{:.2}%", accuracy * 100.))
+                    .pos(g_r.right() + 0.04, g_r.center().y)
+                    .anchor(0., 0.5)
+                    .no_baseline()
+                    .size(0.8)
+                    .color(semi_white(0.85))
+                    .draw();
+            }
+
+            let pb_y = g_r.bottom() + 0.05;
+            let pb_h = 0.12_f32;
+            let play_r = Rect::new(rcx, pb_y, 0.34, pb_h);
+            self.play_btn.render_shadow(ui, play_r, t, |ui, path| {
+                ui.fill_path(&path, pink_deep);
+                ui.text("\u{25b6}")
+                    .pos(play_r.x + 0.035, play_r.center().y)
+                    .anchor(0., 0.5)
+                    .no_baseline()
+                    .size(0.6)
+                    .color(WHITE)
+                    .draw();
+                ui.text(play_label)
+                    .pos(play_r.x + 0.105, play_r.center().y)
+                    .anchor(0., 0.5)
+                    .no_baseline()
+                    .size(0.56)
+                    .max_width(play_r.w - 0.125)
+                    .color(WHITE)
+                    .draw();
+            });
+            let mod_r = Rect::new(play_r.right() + 0.03, pb_y, 0.18, pb_h);
+            ui.fill_path(&mod_r.rounded(0.012), semi_white(0.18));
+            ui.text(tl!("mods"))
+                .pos(mod_r.center().x, mod_r.center().y)
+                .anchor(0.5, 0.5)
+                .no_baseline()
+                .size(0.5)
+                .max_width(mod_r.w - 0.02)
+                .color(WHITE)
+                .draw();
+            self.mod_btn.set(ui, mod_r);
+            let set_r = Rect::new(mod_r.right() + 0.03, pb_y, pb_h, pb_h);
+            ui.fill_path(&set_r.rounded(0.012), semi_white(0.18));
+            let isz = pb_h * 0.58;
+            let sir = Rect::new(set_r.center().x - isz / 2., set_r.center().y - isz / 2., isz, isz);
+            let set_c = if self.local_path.is_some() { WHITE } else { semi_white(0.4) };
+            ui.fill_rect(sir, (*self.icons.edit, sir, ScaleType::Fit, set_c));
+            self.edit_btn.set(ui, set_r);
+
+            if self.info.id.is_some() && !self.xcsim {
+                let ldb_r = Rect::new(set_r.right() + 0.03, pb_y, 0.22, pb_h);
+                ui.fill_path(&ldb_r.rounded(0.014), pink_deep);
+                ui.text("\u{2605}")
+                    .pos(ldb_r.x + 0.035, ldb_r.center().y)
+                    .anchor(0.5, 0.5)
+                    .no_baseline()
+                    .size(0.6)
+                    .color(WHITE)
+                    .draw();
+                let rank_text = if let Some((rank, _)) = &self.ldb {
+                    if let Some(rank) = rank {
+                        format!("\u{2605} #{rank}")
+                    } else {
+                        format!("\u{2605} {}", tl!("ldb-no-rank"))
+                    }
+                } else {
+                    format!("\u{2605} {}", tl!("ldb"))
+                };
+                ui.text(rank_text)
+                    .pos(ldb_r.x + 0.066, ldb_r.center().y)
+                    .anchor(0., 0.5)
+                    .no_baseline()
+                    .size(0.42)
+                    .max_width(ldb_r.w - 0.085)
+                    .color(WHITE)
+                    .draw();
+                self.ldb_btn.set(ui, ldb_r);
+            } else {
+                self.ldb_btn.set(ui, Rect::new(-99., -99., 0.001, 0.001));
+            }
+
+            let fp = Rect::new(rcx, pb_y + pb_h + 0.04, 0.93, top - (pb_y + pb_h + 0.04) - 0.03);
+            ui.fill_path(&fp.rounded(0.016), panel_c);
+            ui.stroke_path(&fp.rounded(0.016), 0.003, border_c);
+            ui.text(format!("\u{2665} {}", tl!("info-desc")))
+                .pos(fp.x + 0.03, fp.y + 0.05)
+                .anchor(0., 0.5)
+                .no_baseline()
+                .size(0.4)
+                .color(muted)
+                .draw();
+            let body_r = Rect::new(fp.x + 0.03, fp.y + 0.08, fp.w - 0.06, fp.h - 0.11);
+            ui.scissor(body_r, |ui| {
+                ui.text(&self.info.intro)
+                    .pos(body_r.x, body_r.y)
+                    .size(0.4)
+                    .multiline()
+                    .max_width(body_r.w)
+                    .color(cream)
+                    .draw();
+            });
+
+            if let Some(dl) = &mut self.downloading {
+                dl.render(ui, t);
+            }
+
+            // ---------------- 侧栏（排行榜 / 信息 / Mods / 编辑） ----------------
+            if self.side_enter_time.is_finite() {
+                let p = edit_transit().map_or(1., |it| ((rt - self.side_enter_time.abs()) / it).min(1.));
+                let p = 1. - (1. - p).powi(3);
+                let p = if self.side_enter_time < 0. { 1. - p } else { p };
+                ui.fill_rect(ui.screen_rect(), semi_black(p * 0.6));
+                let w = self.side_content.width();
+                let lf = f32::tween(&1.04, &(1. - w), p);
+                ui.scope(|ui| {
+                    ui.dx(lf);
+                    ui.dy(-ui.top);
+                    let r = Rect::new(-0.2, 0., 0.2 + w, ui.top * 2.);
+                    ui.fill_rect(
+                        r,
+                        (Color::new(0.165, 0.110, 0.180, p), (r.x, r.y), Color::new(0.10, 0.06, 0.12, p), (r.right(), r.y)),
+                    );
+                    ui.fill_rect(Rect::new(-0.2, 0., 0.006, ui.top * 2.), Color::new(1.0, 0.58, 0.706, 0.45 * p));
+
+                    match self.side_content {
+                        SideContent::Edit => self.side_chart_info(ui, rt),
+                        SideContent::Leaderboard => {
+                            self.side_ldb(ui, rt);
+                            Ok(())
+                        }
+                        SideContent::Info => {
+                            self.side_info(ui, rt);
+                            Ok(())
+                        }
+                        SideContent::Mods => {
+                            self.side_mods(ui, rt);
+                            Ok(())
+                        }
+                    }
+                })?;
+            }
+
+            Ok(())
+        })?;
+
+        self.menu.render(ui, t, 1.);
+        self.fav_menu.render(ui, t, 1.);
+
+        if self.save_task.is_some() {
+            ui.full_loading(tl!("edit-saving"), t);
+        }
+        if self.upload_task.is_some() {
+            ui.full_loading(tl!("uploading"), t);
+        }
+        if self.review_task.is_some() {
+            ui.full_loading(tl!("review-doing"), t);
+        }
+        if self.export_task.is_some() {
+            ui.full_loading(tl!("exporting"), t);
+        }
+        if self.edit_tags_task.is_some()
+            || self.rate_task.is_some()
+            || self.overwrite_task.is_some()
+            || self.update_cksum_task.is_some()
+            || self.toggle_fav_task.is_some()
+            || self.autocomplete_task.is_some()
+        {
+            ui.full_loading("", t);
+        }
+        #[cfg(feature = "testing")]
+        if self.lan_download_task.is_some() {
+            ui.full_loading("正在同步谱面...", t);
+        } else if self.lan_host_waiting {
+            ui.full_loading("正在等待玩家同步谱面...", t);
+        } else if self.lan_loaded_tuple.is_some() && !self.lan_ready {
+            let ct = ui.screen_rect().center();
+            let r = Rect::new(ct.x, ct.y, 0., 0.).nonuniform_feather(0.14, 0.06);
+            self.lan_ready_btn.render_text(ui, r, t, "准备", 0.6, true);
+        } else if self.lan_loaded_tuple.is_some() {
+            ui.full_loading("正在等待所有人同步完成...", t);
+        }
+
+        self.tags.render(ui, rt);
+        self.rate_dialog.render(ui, rt);
+
+        if !self.tr_start.is_nan() {
+            let p = ((rt - self.tr_start - 0.2) / 0.4).clamp(0., 1.);
+            if p >= 1. {
+                self.tr_start = f32::NAN;
+            }
+            let p = 1. - (1. - p).powi(3);
+            let mut r = ui.screen_rect();
+            r.y += r.h * (1. - p);
+            rect_shadow(r, 0.01, 0.5);
+            ui.fill_rect(r, (**self.background.lock().unwrap().as_ref().unwrap(), r));
+            ui.fill_rect(r, semi_black(0.3));
+        }
+
+        self.sf.render(ui, t);
+
+        #[cfg(feature = "testing")]
+        if let Some(panel) = &mut self.lan_panel {
+            if panel.visible() {
+                panel.render(ui, rt);
+            }
+        }
+
+        Ok(())
     }
 
     fn save_edit(&mut self) {
@@ -1573,7 +2268,8 @@ impl Scene for SongScene {
             Err(res) => res,
             Ok(rec) => {
                 self.fade_start = tm.now() as f32 + fade_in_time().unwrap_or_default();
-                if self.my_rate_score == Some(0) && thread_rng().gen_ratio(2, 5) {
+                // XC-SIM 谱面不能评分，游玩结束不弹评分弹窗。
+                if !self.xcsim && self.my_rate_score == Some(0) && thread_rng().gen_ratio(2, 5) {
                     self.rate_dialog.enter(tm.real_time() as _);
                 }
                 if let Some(record) = &mut self.record {
@@ -1681,6 +2377,24 @@ impl Scene for SongScene {
             return Ok(false);
         }
         let rt = tm.real_time() as f32;
+        #[cfg(feature = "testing")]
+        // 成员端：点“准备”后通知房主
+        if self.lan_loaded_tuple.is_some() && !self.lan_ready && self.lan_ready_btn.touch(touch, t) {
+            if let Some(mgr) = &self.lan_manager {
+                if let Ok(mut m) = mgr.lock() {
+                    let _ = m.ready(true);
+                }
+            }
+            self.lan_ready = true;
+            return Ok(true);
+        }
+        #[cfg(feature = "testing")]
+        // 局域网联机面板优先处理触摸
+        if let Some(panel) = &mut self.lan_panel {
+            if panel.visible() {
+                return Ok(panel.touch(touch, rt));
+            }
+        }
         if self.tags.touch(touch, rt) {
             return Ok(true);
         }
@@ -1745,7 +2459,7 @@ impl Scene for SongScene {
                         if self.info_scroll.touch(touch, t) {
                             return Ok(true);
                         }
-                        if self.uploader_btn.touch(touch) {
+                        if !self.xcsim && self.uploader_btn.touch(touch) {
                             button_hit();
                             self.sf.goto(
                                 t,
@@ -1753,7 +2467,7 @@ impl Scene for SongScene {
                             );
                             return Ok(true);
                         }
-                        if self.open_web_btn.touch(touch, rt) {
+                        if !self.xcsim && self.open_web_btn.touch(touch, rt) {
                             open_url(&format!("https://phira.moe/chart/{}", self.info.id.unwrap()))?;
                             return Ok(true);
                         }
@@ -1780,6 +2494,7 @@ impl Scene for SongScene {
             return Ok(true);
         }
         if self.scene_task.is_none() && self.next_scene.is_none() && self.play_btn.touch(touch, t) {
+            prpr::ui::start_playing_sfx();
             if self.local_path.is_some() {
                 self.launch(GameMode::Normal, false)?;
             } else {
@@ -1826,7 +2541,7 @@ impl Scene for SongScene {
                 return Ok(true);
             }
         }
-        if self.info.id.is_some() && self.ldb_btn.touch(touch) {
+        if self.info.id.is_some() && !self.xcsim && self.ldb_btn.touch(touch) {
             button_hit();
             self.side_content = SideContent::Leaderboard;
             self.side_enter_time = tm.real_time() as _;
@@ -1850,6 +2565,88 @@ impl Scene for SongScene {
 
     fn update(&mut self, tm: &mut TimeManager) -> Result<()> {
         let t = tm.now() as f32;
+        #[cfg(feature = "testing")]
+        // 更新局域网联机面板（同步服务器列表）
+        if let Some(panel) = &mut self.lan_panel {
+            if panel.visible() {
+                panel.update(t)?;
+                // 检测房主开始游戏（lan_launched 防止重复触发）
+                let started = !self.lan_launched
+                    && self
+                        .lan_manager
+                        .as_ref()
+                        .is_some_and(|m| {
+                            let mgr = m.lock().unwrap();
+                            mgr.is_started()
+                        });
+                if started {
+                    self.lan_game = true;
+                    self.lan_launched = true;
+                    panel.hide();
+                    let is_member = self.lan_manager.as_ref().is_some_and(|m| m.lock().unwrap().is_member());
+                    if is_member {
+                        // 成员端：先检查本地是否有相同 id 谱面，有则跳过下载；否则从房主下载
+                        let mgr = self.lan_manager.clone().unwrap();
+                        let black = BLACK_TEXTURE.clone();
+                        self.lan_download_task = Some(Task::new(async move {
+                            // 本地查重：若本地已有与房主相同 id 的谱面，直接用本地谱面
+                            let host_id = mgr.lock().unwrap().started_chart_id();
+                            if let Some(id) = host_id {
+                                if let Some(existing) = get_data().charts.iter().find(|c| c.info.id == Some(id)) {
+                                    let local_path = existing.local_path.clone();
+                                    let root = format!("{}/{local_path}", dir::charts()?);
+                                    let dir = prpr::dir::Dir::new(&root)?;
+                                    let info: ChartInfo = serde_yaml::from_reader(dir.open("info.yml")?)?;
+                                    let tuple = load_local_tuple(&local_path, black, info).await?;
+                                    // 本地已有谱面，通知房主本成员已就绪（跳过下载）
+                                    let _ = mgr.lock().unwrap().notify_sync_ready();
+                                    return Ok(tuple);
+                                }
+                            }
+                            // 否则从房主下载谱面
+                            let chart_id = mgr.lock().unwrap().download_host_chart()?;
+                            let local_path = format!("download/{}", chart_id);
+                            let root = format!("{}/{local_path}", dir::charts()?);
+                            let dir = prpr::dir::Dir::new(&root)?;
+                            let info: ChartInfo = serde_yaml::from_reader(dir.open("info.yml")?)?;
+                            let tuple = load_local_tuple(&local_path, black, info.clone()).await?;
+                            // 注册到本地谱面库
+                            get_data_mut().charts.push(LocalChart {
+                                info: BriefChartInfo::from(info),
+                                local_path,
+                                record: None,
+                                mods: Mods::default(),
+                                played_unlock: false,
+                            });
+                            save_data()?;
+                            NEED_UPDATE.store(true, Ordering::Relaxed);
+                            Ok(tuple)
+                        }));
+                    } else {
+                        // 房主：进入等待（房主本机谱面即就绪），等所有成员就绪后开始
+                        self.lan_host_waiting = true;
+                        self.lan_host_ready = true;
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "testing")]
+        // 房主：即使处于加载/等待界面也持续监听，所有成员 + 自己就绪后才广播开始并进入
+        if self.lan_host_waiting {
+            let members_ready = self
+                .lan_manager
+                .as_ref()
+                .is_some_and(|m| m.lock().unwrap().host_all_ready());
+            if members_ready && self.lan_host_ready {
+                self.lan_host_waiting = false;
+                if let Some(mgr) = &self.lan_manager {
+                    if let Ok(mut m) = mgr.lock() {
+                        let _ = m.host_start_playing();
+                    }
+                }
+                self.launch(GameMode::Normal, false)?;
+            }
+        }
         self.menu.update(t);
         self.fav_menu.update(t);
         if self.fav_btn.update_long_touch(t, &mut self.fav_long_touch) {
@@ -1973,6 +2770,18 @@ impl Scene for SongScene {
                 self.load_task = None;
             }
         }
+        if let Some(task) = &mut self.xcsim_uploader_task {
+            if let Some(res) = task.take() {
+                match res {
+                    Ok(Some((name, avatar))) => {
+                        self.xcsim_uploader_name = Some(name);
+                        self.xcsim_uploader_avatar = avatar.map(|it| SafeTexture::from(it).with_mipmap());
+                    }
+                    _ => {}
+                }
+                self.xcsim_uploader_task = None;
+            }
+        }
         if let Some(task) = &mut self.preview_task {
             if let Some(result) = task.take() {
                 match result {
@@ -1996,6 +2805,46 @@ impl Scene for SongScene {
                 self.update_menu();
             }
         }
+        #[cfg(feature = "testing")]
+        // 成员端：从房主下载谱面完成（保留，等待所有人同步后开始）
+        if let Some(task) = &mut self.lan_download_task {
+            if let Some(res) = task.take() {
+                self.lan_download_task = None;
+                match res {
+                    Ok(tuple) => {
+                        self.lan_loaded_tuple = Some(tuple);
+                        // 房主开启“等待其他玩家”时，成员需点“准备”；否则自动就绪
+                        let waiting = self
+                            .lan_manager
+                            .as_ref()
+                            .is_some_and(|m| m.lock().unwrap().is_waiting());
+                        self.lan_ready = !waiting;
+                        if !waiting {
+                            if let Some(mgr) = &self.lan_manager {
+                                if let Ok(mut m) = mgr.lock() {
+                                    let _ = m.ready(true);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => show_error(e),
+                }
+            }
+        }
+        #[cfg(feature = "testing")]
+        // 成员端：已准备且收到开始游玩信号后进入
+        if self.lan_loaded_tuple.is_some() && self.lan_ready {
+            let start = self
+                .lan_manager
+                .as_ref()
+                .is_some_and(|m| m.lock().unwrap().member_start_playing());
+            if start {
+                if let Some(tuple) = self.lan_loaded_tuple.take() {
+                    self.load_tuple(tuple)?;
+                    self.launch(GameMode::Normal, false)?;
+                }
+            }
+        }
         if let Some(task) = &mut self.scene_task {
             if let Some(res) = poll_future(task.as_mut()) {
                 match res {
@@ -2016,7 +2865,24 @@ impl Scene for SongScene {
                             })
                             .show();
                     }
-                    Ok(scene) => self.next_scene = Some(scene),
+                    Ok(scene) => {
+                        #[cfg(feature = "testing")]
+                        // 联机游玩结束：返回后重新打开局域网联机面板
+                        if self.lan_game {
+                            self.lan_game = false;
+                            self.lan_launched = false;
+                            // 重置开始状态，避免返回时再次自动触发开始
+                            if let Some(mgr) = &self.lan_manager {
+                                if let Ok(mut m) = mgr.lock() {
+                                    m.reset_start();
+                                }
+                            }
+                            if let Some(panel) = &mut self.lan_panel {
+                                panel.show(tm.real_time() as _);
+                            }
+                        }
+                        self.next_scene = Some(scene);
+                    }
                 }
                 self.scene_task = None;
             }
@@ -2086,6 +2952,54 @@ impl Scene for SongScene {
                 }
                 "export" => {
                     request_export(format!("{}.zip", sanitize(&self.info.name)));
+                }
+                #[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32", target_env = "ohos")))]
+                "render" => {
+                    use crate::scene::RenderSettingsScene;
+                    let local_path = self.local_path.clone().unwrap();
+                    let chart_dir = format!("{}/{}", dir::charts()?, local_path);
+                    // Load full ChartInfo from info.yml
+                    let info_path = format!("{}/info.yml", chart_dir);
+                    let info: prpr::info::ChartInfo = match std::fs::read_to_string(&info_path) {
+                        Ok(text) => match serde_yaml::from_str(&text) {
+                            Ok(i) => i,
+                            Err(e) => {
+                                show_message(format!("Failed to parse info.yml: {e}")).error();
+                                return Ok(());
+                            }
+                        },
+                        Err(e) => {
+                            show_message(format!("Failed to read info.yml: {e}")).error();
+                            return Ok(());
+                        }
+                    };
+                    // Pause preview audio before going to render
+                    if let Some(preview) = &mut self.preview {
+                        let _ = preview.pause();
+                    }
+                    let pname = get_data().me.as_ref().map(|it| it.name.clone()).unwrap_or_else(|| "Guest".to_string());
+                    let prks = get_data().me.as_ref().map(|it| it.rks).unwrap_or(0.0);
+                    self.next_scene = Some(NextScene::Overlay(Box::new(RenderSettingsScene::new(
+                        chart_dir,
+                        info,
+                        &get_data().config,
+                        pname,
+                        prks,
+                        None,
+                    ))));
+                }
+                #[cfg(feature = "testing")]
+                "lan-multiplayer" => {
+                    // 打开局域网联机面板
+                    if let Some(manager) = self.lan_manager.clone() {
+                        // 记录当前谱面路径与在线 id，用于开始游戏时同步谱面
+                        if let Ok(mut mgr) = manager.lock() {
+                            mgr.set_chart_path(self.local_path.clone());
+                            mgr.set_chart_id(self.info.id);
+                        }
+                        let panel = self.lan_panel.get_or_insert_with(|| crate::lan::LanPanel::new(manager));
+                        panel.show(tm.real_time() as _);
+                    }
                 }
                 _ => {}
             }
@@ -2614,64 +3528,151 @@ impl Scene for SongScene {
     }
 
     fn render(&mut self, tm: &mut TimeManager, ui: &mut Ui) -> Result<()> {
+        if prpr::ui::PREFER_ALT_UI.load(Ordering::Relaxed) {
+            return self.render_a1(tm, ui);
+        }
         set_camera(&ui.camera());
         let t = tm.now() as f32;
+        let top = ui.top;
+        // XCHS UI 皮肤配色；官方皮肤保持原样。
+        let xchs = prpr::ui::PREFER_ALT_UI.load(Ordering::Relaxed);
+        let accent = Color::new(1.0, 0.58, 0.706, 1.);
+        let accent_deep = Color::new(0.949, 0.412, 0.580, 1.);
+        let cream = Color::new(0.984, 0.973, 0.886, 1.);
+        let muted = Color::new(1.0, 0.776, 0.847, 0.62);
+        let panel_border = Color::new(1.0, 0.776, 0.847, 0.45);
         ui.fill_rect(ui.screen_rect(), (*self.illu.texture.1, ui.screen_rect()));
-        ui.fill_rect(ui.screen_rect(), semi_black(0.55));
+        ui.fill_rect(ui.screen_rect(), if xchs { Color::new(0.10, 0.06, 0.12, 0.72) } else { semi_black(0.55) });
 
         let r = ui.back_rect();
         self.back_btn.set(ui, r);
-        ui.fill_rect(r, (*self.icons.back, r, ScaleType::Fit));
+        if !xchs {
+            ui.fill_rect(r, (*self.icons.back, r, ScaleType::Fit));
+        }
 
         let alpha = fade_in_time().map_or(1., |tt| ((t - self.fade_start) / tt).clamp(-1., 0.) + 1.);
         ui.alpha::<Result<()>>(alpha, |ui| {
-            let r = ui
-                .text(&self.info.name)
-                .max_width(0.57 - r.right())
-                .size(1.2)
-                .pos(r.right() + 0.02, r.y)
-                .draw();
-            ui.text(&self.info.composer)
-                .size(0.5)
-                .pos(r.x + 0.02, r.bottom() + 0.03)
-                .color(semi_white(0.8))
-                .draw();
+            let r = if xchs {
+                // XCHS 头部：返回胶囊 + 奶油色标题 + 爱心 + 下划线
+                ui.fill_path(&r.feather(-0.004).rounded(0.02), Color::new(1.0, 0.58, 0.706, 0.14));
+                ui.text("\u{2190}")
+                    .pos(r.center().x, r.center().y)
+                    .anchor(0.5, 0.5)
+                    .no_baseline()
+                    .size(0.5)
+                    .color(accent)
+                    .draw();
+                let title = ui
+                    .text(&self.info.name)
+                    .pos(r.right() + 0.04, -top + 0.155 * 0.38)
+                    .anchor(0., 0.5)
+                    .no_baseline()
+                    .size(0.9)
+                    .max_width(0.62)
+                    .color(cream)
+                    .draw();
+                let heart = ui
+                    .text("\u{2665}")
+                    .pos(title.right() + 0.028, title.center().y)
+                    .anchor(0., 0.5)
+                    .no_baseline()
+                    .size(0.5)
+                    .color(accent)
+                    .draw();
+                ui.fill_path(&Rect::new(title.x, -top + 0.155 - 0.014, 0.13, 0.006).rounded(0.003), accent);
+                if !self.info.composer.is_empty() {
+                    ui.text(&self.info.composer)
+                        .pos(heart.right() + 0.03, title.center().y)
+                        .anchor(0., 0.5)
+                        .no_baseline()
+                        .max_width((0.97 - heart.right()).max(0.05))
+                        .size(0.45)
+                        .color(muted)
+                        .draw();
+                }
+                title
+            } else {
+                ui.text(&self.info.name)
+                    .max_width(0.57 - r.right())
+                    .size(1.2)
+                    .pos(r.right() + 0.02, r.y)
+                    .draw()
+            };
+            if !xchs {
+                ui.text(&self.info.composer)
+                    .size(0.5)
+                    .pos(r.x + 0.02, r.bottom() + 0.03)
+                    .color(semi_white(0.8))
+                    .draw();
+            }
 
             // bottom bar
             let s = 0.25;
             let r = Rect::new(-0.94, ui.top - s - 0.06, s, s);
-            let icon = self.record.as_ref().map_or(0, |it| icon_index(it.score as _, it.full_combo));
-            ui.fill_rect(r, (*self.rank_icons[icon], r, ScaleType::Fit));
+            let icon = self.record.as_ref().map_or(0, |it| {
+                if self.xcsim {
+                    icon_index_xcsim(it.score as _)
+                } else {
+                    icon_index(it.score as _, it.full_combo)
+                }
+            });
+            let r_draw = contain_rect(&self.rank_icons[icon], r);
+            if xchs {
+                // XCHS 最佳成绩卡片：粉色辉光 + 李子色面板 + 粉边
+                let bp = Rect::new(-0.975, ui.top - 0.50, 0.78, 0.47);
+                ui.fill_path(&bp.feather(0.009).rounded(0.032), Color::new(1.0, 0.58, 0.706, 0.14));
+                ui.fill_path(&bp.rounded(0.028), Color::new(0.145, 0.098, 0.157, 0.98));
+                ui.stroke_path(&bp.rounded(0.028), 0.0035, panel_border);
+            }
+            ui.fill_rect(r_draw, (*self.rank_icons[icon], r_draw, ScaleType::Fit));
             let score = self.record.as_ref().map(|it| it.score).unwrap_or_default();
             let accuracy = self.record.as_ref().map(|it| it.accuracy).unwrap_or_default();
+            // XC-SIM 分数固定显示 8 位，官方/本地谱面显示 7 位。
+            let score_text = if self.xcsim { format!("{score:08}") } else { format!("{score:07}") };
             let r = ui
-                .text(format!("{score:07}"))
+                .text(score_text)
                 .pos(r.right() + 0.01, r.center().y)
                 .anchor(0., 1.)
                 .size(1.2)
+                .color(if xchs { cream } else { WHITE })
                 .draw();
             ui.text(format!("{:.2}%", accuracy * 100.))
                 .pos(r.x, r.bottom() + 0.01)
                 .anchor(0., 0.)
                 .size(0.7)
-                .color(semi_white(0.7))
+                .color(if xchs { muted } else { semi_white(0.7) })
                 .draw();
 
-            if self.info.id.is_some() {
+            if self.info.id.is_some() && !self.xcsim {
                 let h = 0.09;
                 let mut r = Rect::new(r.x, r.y - h, h, h);
                 ui.fill_rect(r, (*self.icons.ldb, r, ScaleType::Fit));
                 if let Some((rank, _)) = &self.ldb {
-                    ui.text(if let Some(rank) = rank {
+                    let rank_text = if let Some(rank) = rank {
                         format!("#{rank}")
                     } else {
                         tl!("ldb-no-rank").into_owned()
-                    })
-                    .pos(r.right() + 0.01, r.center().y)
-                    .anchor(0., 0.5)
-                    .no_baseline()
-                    .size(0.7)
-                    .draw();
+                    };
+                    if xchs {
+                        // XCHS：名次胶囊
+                        let tr = ui
+                            .text(rank_text.as_str())
+                            .pos(r.right() + 0.01, r.center().y)
+                            .anchor(0., 0.5)
+                            .no_baseline()
+                            .size(0.7)
+                            .measure();
+                        let chip = tr.feather(0.014);
+                        ui.fill_path(&chip.rounded(0.018), Color::new(0.255, 0.130, 0.190, 0.96));
+                        ui.stroke_path(&chip.rounded(0.018), 0.0035, panel_border);
+                    }
+                    ui.text(rank_text.as_str())
+                        .pos(r.right() + 0.01, r.center().y)
+                        .anchor(0., 0.5)
+                        .no_baseline()
+                        .size(0.7)
+                        .color(if xchs { cream } else { WHITE })
+                        .draw();
                 } else {
                     ui.loading(
                         r.right() + 0.04,
@@ -2693,8 +3694,12 @@ impl Scene for SongScene {
             let w = 0.26;
             let pad = 0.08;
             let r = Rect::new(1. - pad - w, ui.top - pad - w, w, w);
+            if xchs {
+                // XCHS：主操作按钮的粉色辉光
+                ui.fill_path(&r.feather(0.012).rounded(0.034), Color::new(1.0, 0.58, 0.706, 0.16));
+            }
             self.play_btn.render_shadow(ui, r, t, |ui, path| {
-                ui.fill_path(&path, semi_white(0.3));
+                ui.fill_path(&path, if xchs { accent_deep } else { semi_white(0.3) });
                 let r = r.feather(-0.04);
                 ui.fill_rect(
                     r,
@@ -2716,6 +3721,15 @@ impl Scene for SongScene {
                 let s = 0.08;
                 let r = Rect::new(-s, 0., s, s);
                 let cc = semi_white(0.4);
+                let pill = |ui: &mut Ui, r: Rect| {
+                    if xchs {
+                        // XCHS：动作图标下的李子色胶囊
+                        let pr = r.feather(0.008);
+                        ui.fill_path(&pr.rounded(0.018), Color::new(0.255, 0.130, 0.190, 0.96));
+                        ui.stroke_path(&pr.rounded(0.018), 0.0035, panel_border);
+                    }
+                };
+                pill(ui, r);
                 ui.fill_rect(r, (*self.icons.menu, r, ScaleType::Fit, if self.menu_options.is_empty() { cc } else { WHITE }));
                 self.menu_btn.set(ui, r);
                 if self.need_show_menu {
@@ -2727,6 +3741,7 @@ impl Scene for SongScene {
                     self.menu.show(ui, t, Rect::new(r.x - d, r.bottom() + 0.02, r.w + d, h));
                 }
                 ui.dx(-r.w - 0.03);
+                pill(ui, r);
                 ui.fill_rect(r, (*self.icons.info, r, ScaleType::Fit));
                 self.info_btn.set(ui, r);
                 ui.dx(-r.w - 0.03);
@@ -2743,6 +3758,7 @@ impl Scene for SongScene {
                         fav
                     };
                     let fav_icon = if is_fav { &self.icons.star } else { &self.icons.star_outline };
+                    pill(ui, r);
                     ui.fill_rect(r, (**fav_icon, r, ScaleType::Fit));
                     self.fav_btn.set(ui, r);
                     if self.need_show_fav_menu {
@@ -2755,10 +3771,12 @@ impl Scene for SongScene {
                     }
                     ui.dx(-r.w - 0.03);
 
+                    pill(ui, r);
                     ui.fill_rect(r, (*self.icons.edit, r, ScaleType::Fit, if self.local_path.is_some() { WHITE } else { cc }));
                     self.edit_btn.set(ui, r);
                     ui.dx(-r.w - 0.03);
                 }
+                pill(ui, r);
                 ui.fill_rect(r, (*self.icons.r#mod, r, ScaleType::Fit, if self.local_path.is_some() { WHITE } else { cc }));
                 self.mod_btn.set(ui, r);
             });
@@ -2779,7 +3797,16 @@ impl Scene for SongScene {
                     ui.dx(lf);
                     ui.dy(-ui.top);
                     let r = Rect::new(-0.2, 0., 0.2 + w, ui.top * 2.);
-                    ui.fill_rect(r, (Color::default(), (r.x, r.y), Color::new(0., 0., 0., p * 0.7), (r.right(), r.y)));
+                    if xchs {
+                        // XCHS：李子色侧栏 + 粉色左边缘
+                        ui.fill_rect(
+                            r,
+                            (Color::new(0.165, 0.110, 0.180, p), (r.x, r.y), Color::new(0.10, 0.06, 0.12, p), (r.right(), r.y)),
+                        );
+                        ui.fill_rect(Rect::new(-0.2, 0., 0.006, ui.top * 2.), Color::new(1.0, 0.58, 0.706, 0.45 * p));
+                    } else {
+                        ui.fill_rect(r, (Color::default(), (r.x, r.y), Color::new(0., 0., 0., p * 0.7), (r.right(), r.y)));
+                    }
 
                     match self.side_content {
                         SideContent::Edit => self.side_chart_info(ui, rt),
@@ -2826,6 +3853,20 @@ impl Scene for SongScene {
         {
             ui.full_loading("", t);
         }
+        #[cfg(feature = "testing")]
+        // 联机同步阶段：成员下载 / 房主等待时显示加载动画
+        if self.lan_download_task.is_some() {
+            ui.full_loading("正在同步谱面...", t);
+        } else if self.lan_host_waiting {
+            ui.full_loading("正在等待玩家同步谱面...", t);
+        } else if self.lan_loaded_tuple.is_some() && !self.lan_ready {
+            // 房主开启“等待其他玩家”：成员需点准备
+            let ct = ui.screen_rect().center();
+            let r = Rect::new(ct.x, ct.y, 0., 0.).nonuniform_feather(0.14, 0.06);
+            self.lan_ready_btn.render_text(ui, r, t, "准备", 0.6, true);
+        } else if self.lan_loaded_tuple.is_some() {
+            ui.full_loading("正在等待所有人同步完成...", t);
+        }
         let rt = tm.real_time() as f32;
         self.tags.render(ui, rt);
         self.rate_dialog.render(ui, rt);
@@ -2845,12 +3886,24 @@ impl Scene for SongScene {
 
         self.sf.render(ui, t);
 
+        #[cfg(feature = "testing")]
+        // 渲染局域网联机面板（覆盖在最上层）
+        if let Some(panel) = &mut self.lan_panel {
+            if panel.visible() {
+                panel.render(ui, rt);
+            }
+        }
+
         Ok(())
     }
 
     fn next_scene(&mut self, tm: &mut TimeManager) -> NextScene {
         if !self.tr_start.is_nan() {
             return NextScene::None;
+        }
+        // Handle gamepad B-key back
+        if prpr::gamepad::take_back_pressed() && self.next_scene.is_none() {
+            self.next_scene = Some(NextScene::PopWithResult(Box::new(false)));
         }
         if let Some(scene) = self.next_scene.take().or_else(|| self.sf.next_scene(tm.now() as _)) {
             *self.background.lock().unwrap() = None;

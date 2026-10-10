@@ -93,6 +93,18 @@ impl Popup {
             self.rect.x = self.rect.x.clamp(area.x, area.right() - self.rect.w);
             self.rect.y = self.rect.y.clamp(area.y, area.bottom() - self.rect.h);
         }
+        // 弹窗不能超出屏幕：一旦整体比屏幕还高，可视高度就等于内容高度，
+        // 滚动范围恒为 0，下面的选项就永远选不到了。把高度限制在屏幕内，
+        // 放不下的部分交给内部 Scroll。
+        let screen = Rect::new(-1., -ui.top, 2., ui.top * 2.);
+        let margin = 0.03;
+        let max_h = (screen.h - margin * 2.).max(0.1);
+        if self.rect.h > max_h {
+            self.rect.h = max_h;
+        }
+        let min_y = screen.y + margin;
+        let max_y = screen.bottom() - margin - self.rect.h;
+        self.rect.y = if max_y > min_y { self.rect.y.clamp(min_y, max_y) } else { min_y };
         self.showing = true;
         self.fader.sub(t);
     }
@@ -106,9 +118,64 @@ impl Popup {
         if !self.fader.transiting() && !self.showing {
             return;
         }
+        let xchs = prpr::ui::PREFER_ALT_UI.load(std::sync::atomic::Ordering::Relaxed);
         let r = self.rect;
         self.scroll.size((r.w, r.h));
         self.fader.reset();
+        if xchs {
+            // XCHS UI: 不做位移，只做「自上而下展开」的裁剪 + 同步透明度
+            // （与 xcsim popup_app.rs 的 anim_p 行为一致）。
+            // p: 0 = 完全收起，1 = 完全展开
+            let p = if self.showing {
+                if self.fader.transiting() { self.fader.progress(t).abs() } else { 1. }
+            } else {
+                if self.fader.transiting() { self.fader.progress(t).abs() } else { 0. }
+            };
+            ui.abs_scope(|ui| {
+                ui.dx(r.x);
+                ui.dy(r.y);
+                ui.alpha(p * alpha, |ui| {
+                    ui.scissor(Rect::new(0., 0., r.w, r.h * p), |ui| {
+                        let accent = Color::new(0.949, 0.412, 0.580, 1.);
+                        let body_bg = Color::new(0.165, 0.110, 0.180, 1.);
+                        let text_c = Color::new(0.984, 0.973, 0.886, 1.);
+                        let sep_c = Color::new(1.0, 0.776, 0.847, 0.10);
+                        let border_c = Color::new(1.0, 0.776, 0.847, 0.45);
+                        let sel_bg = Color::new(accent.r, accent.g, accent.b, 0.20);
+                        let panel = Rect::new(0., 0., r.w, r.h);
+                        let path = panel.rounded(0.022);
+                        ui.fill_path(&path, body_bg);
+                        ui.stroke_path(&path, 0.004, border_c);
+                        self.scroll.render(ui, |ui| {
+                            for (id, (opt, btn)) in self.options.iter_mut().enumerate() {
+                                if id != 0 {
+                                    ui.fill_rect(Rect::new(0.024, -0.001, r.w - 0.048, 0.0015), sep_c);
+                                }
+                                let ir = Rect::new(0., 0., r.w, self.height);
+                                btn.set(ui, ir);
+                                let chosen = id == self.selected;
+                                let pill = Rect::new(ir.x + 0.012, ir.y + 0.006, ir.w - 0.024, ir.h - 0.012);
+                                if chosen {
+                                    ui.fill_path(&pill.rounded(0.018), sel_bg);
+                                    ui.fill_path(&Rect::new(pill.x, pill.y + 0.008, 0.005, pill.h - 0.016).rounded(0.0025), accent);
+                                }
+                                ui.text(opt.as_str())
+                                    .pos(self.left + if chosen { 0.012 } else { 0.006 }, self.height / 2.)
+                                    .anchor(0., 0.5)
+                                    .no_baseline()
+                                    .size(self.size)
+                                    .max_width(r.w - self.left * 2.)
+                                    .color(if chosen { accent } else { text_c })
+                                    .draw();
+                                ui.dy(self.height);
+                            }
+                            (r.w, self.options.len() as f32 * self.height)
+                        });
+                    });
+                });
+            });
+            return;
+        }
         ui.abs_scope(|ui| {
             ui.dx(r.x);
             ui.dy(r.y);
@@ -182,6 +249,12 @@ impl Popup {
                 }
                 if self.rect.contains(touch.position) {
                     for (id, (_, btn)) in self.options.iter_mut().enumerate() {
+                        // popup 显示后第一个触摸/鼠标序列可能没有 Started 事件
+                        // （Started 被主按钮消费了），在任何 phase 下补设 id
+                        if !btn.touching() && btn.contains(touch.position) {
+                            let started_touch = Touch { phase: TouchPhase::Started, ..*touch };
+                            let _ = btn.touch(&started_touch);
+                        }
                         if btn.touch(touch) {
                             button_hit();
                             if self.selected != id {
@@ -230,6 +303,7 @@ pub struct ChooseButton {
     width: Option<f32>,
     height: f32,
     need_to_show: bool,
+    bottom: bool,
 }
 
 impl ChooseButton {
@@ -238,8 +312,9 @@ impl ChooseButton {
             btn: DRectButton::new(),
             popup: Popup::new(),
             width: None,
-            height: 0.34,
+            height: 0.25,
             need_to_show: false,
+            bottom: true,
         }
     }
 
@@ -255,6 +330,27 @@ impl ChooseButton {
         self
     }
 
+    /// Text size of the button label and of the popup rows.
+    #[inline]
+    pub fn with_size(mut self, size: f32) -> Self {
+        self.popup = self.popup.with_size(size);
+        self
+    }
+
+    /// Height of a single popup row.
+    #[inline]
+    pub fn with_height(mut self, height: f32) -> Self {
+        self.height = height;
+        self
+    }
+
+    /// Set popup direction: \	rue\ pops downward (default), \alse\ pops upward.
+    #[inline]
+    pub fn with_bottom(mut self, bottom: bool) -> Self {
+        self.bottom = bottom;
+        self
+    }
+
     #[inline]
     pub fn selected(&self) -> usize {
         self.popup.selected
@@ -265,16 +361,28 @@ impl ChooseButton {
         self.popup.changed()
     }
 
+    pub fn set_options(&mut self, options: Vec<String>) {
+        self.popup.set_options(options);
+    }
+
+    pub fn set_selected(&mut self, selected: usize) {
+        self.popup.set_selected(selected);
+    }
+
     pub fn render(&mut self, ui: &mut Ui, r: Rect, t: f32) {
         self.btn
             .render_text(ui, r, t, &self.popup.options[self.popup.selected].0, self.popup.size, false);
         if self.need_to_show {
             let pad = 0.007;
-            let mut rr = Rect::new(r.x, r.bottom() + pad, self.width.unwrap_or(r.w), self.height);
             let delta = 0.1;
-            rr.x -= delta;
-            rr.w += delta;
-            self.popup.set_bottom(true);
+            let popup_height = self.height * self.popup.options.len().max(1) as f32;
+            let mut rr = Rect::new(r.x - delta, 0., self.width.unwrap_or(r.w) + delta, popup_height);
+            if self.bottom {
+                rr.y = r.bottom() + pad;
+            } else {
+                rr.y = r.y - pad - popup_height;
+            }
+            self.popup.set_bottom(self.bottom);
             self.popup.show(ui, t, rr);
             self.need_to_show = false;
         }
@@ -301,7 +409,7 @@ impl ChooseButton {
     }
 
     pub fn touch(&mut self, touch: &Touch, t: f32) -> bool {
-        if self.btn.touch(touch, t) {
+        if self.btn.touch(touch, t) && !self.popup.showing() {
             self.need_to_show = true;
             true
         } else {

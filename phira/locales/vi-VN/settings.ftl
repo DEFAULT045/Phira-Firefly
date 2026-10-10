@@ -6,6 +6,7 @@ audio = Âm thanh
 chart = Chart
 debug = Gỡ lỗi
 about = Giới thiệu
+theme = Chủ đề
 
 item-lang = Ngôn ngữ
 item-offline = Chế độ Offline
@@ -18,6 +19,24 @@ item-mp-sub = Bật tính năng nhiều người chơi
 item-mp-addr = Máy chủ nhiều người chơi
 item-mp-addr-sub = Kết nối đến một máy chủ nhiều người chơi
 item-mp-addr-invalid = Địa chỉ không hợp lệ
+mp-server-page = Máy chủ nhiều người chơi
+mp-server-none = Chưa chọn máy chủ
+mp-server-current = Hiện tại
+mp-server-name-title = Tên máy chủ
+mp-server-name-prompt = Nhập ghi chú cho máy chủ này.
+mp-server-name-empty = Tên máy chủ không được để trống.
+mp-server-address-title = Địa chỉ máy chủ
+mp-server-address-prompt = Nhập địa chỉ host:port.
+mp-server-address-duplicate = Địa chỉ máy chủ này đã tồn tại.
+mp-server-added = Đã thêm địa chỉ máy chủ.
+mp-server-name-updated = Đã cập nhật tên máy chủ.
+mp-server-address-updated = Đã cập nhật địa chỉ máy chủ.
+mp-server-deleted = Đã xóa địa chỉ máy chủ.
+mp-server-selected = Đã chọn địa chỉ máy chủ.
+mp-server-rename = Đổi tên
+mp-server-edit-address = Sửa địa chỉ
+mp-server-delete = Xóa
+mp-server-delete-confirm = Xóa máy chủ nhiều người chơi này?
 item-lowq = Độ phân giải thấp
 item-lowq-sub = Giảm chất lượng giao diện để tăng hiệu suất
 item-clear-cache = Xóa bộ nhớ đệm
@@ -97,3 +116,10 @@ about-content =
   { $localization }
 
   Và nhiều người đánh giá chart tình nguyện khác. Để xem danh sách đầy đủ, vui lòng tham khảo https://phira.moe/staff
+item-render-backend = Render Backend
+item-render-backend-sub = Requires restart to take effect
+item-render-backend-auto = Auto
+item-render-backend-wgpu = Vulkan
+item-render-backend-opengl = OpenGL
+item-perf-monitor = Giám sát hiệu năng
+item-perf-monitor-sub = Hiển thị FPS/CPU/Bộ nhớ/GPU/Ổ đĩa góc trên trái trong game

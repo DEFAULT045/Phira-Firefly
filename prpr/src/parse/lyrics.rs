@@ -9,7 +9,7 @@ pub struct LyricWord {
     pub end_time: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LyricRole {
     Main,
     Duet,
@@ -30,6 +30,11 @@ pub type Lyrics = Vec<LyricLine>;
 fn parse_time(s: &str) -> Result<f64> {
     let parts: Vec<&str> = s.split(':').collect();
     match parts.len() {
+        1 => {
+            // 纯秒数格式：SS.xxx（Apple Music TTML 不足一分钟时省略分:）
+            let seconds: f64 = parts[0].parse()?;
+            Ok(seconds)
+        }
         2 => {
             let minutes: f64 = parts[0].parse()?;
             let seconds: f64 = parts[1].parse()?;
@@ -47,10 +52,21 @@ fn parse_time(s: &str) -> Result<f64> {
 
 fn extract_attr<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     let prefix = format!("{}=\"", name);
-    s.find(&prefix).map(|start| {
-        let start = start + prefix.len();
-        s[start..].find('"').map(|end| &s[start..start + end])
-    }).flatten()
+    s.find(&prefix)
+        .map(|start| {
+            let start = start + prefix.len();
+            s[start..].find('"').map(|end| &s[start..start + end])
+        })
+        .flatten()
+}
+
+/// 解码 TTML/HTML 常见字符实体。
+fn decode_entities(text: &str) -> String {
+    text.replace("&apos;", "'")
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
 }
 
 fn parse_ttml_span(s: &str, default_time: Option<(f64, f64)>) -> Result<LyricWord> {
@@ -60,16 +76,16 @@ fn parse_ttml_span(s: &str, default_time: Option<(f64, f64)>) -> Result<LyricWor
         &s[content_start..content_start + content_end]
     };
 
-    let start_time = extract_attr(s, "begin")
-        .and_then(|v| parse_time(v).ok())
-        .or(default_time.map(|t| t.0));
-    
-    let end_time = extract_attr(s, "end")
-        .and_then(|v| parse_time(v).ok())
-        .or(default_time.map(|t| t.1));
-    
+    let start_time = extract_attr(s, "begin").and_then(|v| parse_time(v).ok()).or(default_time.map(|t| t.0));
+
+    let end_time = extract_attr(s, "end").and_then(|v| parse_time(v).ok()).or(default_time.map(|t| t.1));
+
     if let (Some(start_time), Some(end_time)) = (start_time, end_time) {
-        Ok(LyricWord { text: text.to_string(), start_time, end_time })
+        Ok(LyricWord {
+            text: decode_entities(text),
+            start_time,
+            end_time,
+        })
     } else {
         Err(anyhow::anyhow!("span has no time attributes and no default time provided"))
     }
@@ -80,23 +96,23 @@ fn parse_ttml_p(s: &str) -> Result<Vec<LyricLine>> {
         .context("p has no begin attribute")
         .and_then(|v| parse_time(v))
         .context("invalid begin time")?;
-    
+
     let p_end_time = extract_attr(s, "end")
         .context("p has no end attribute")
         .and_then(|v| parse_time(v))
         .context("invalid end time")?;
-    
+
     let agent = extract_attr(s, "ttm:agent").map(|v| v.to_string());
-    
+
     let role = if agent.as_deref() == Some("v1") {
         LyricRole::Main
     } else {
         LyricRole::Duet
     };
-    
+
     let mut main_words = Vec::new();
     let mut bg_lines = Vec::new();
-    
+
     let content_start = s.find('>').context("p has no content")? + 1;
     let content_end = s.rfind("</p>").context("p has no closing tag")?;
     let content = &s[content_start..content_end];
@@ -105,14 +121,14 @@ fn parse_ttml_p(s: &str) -> Result<Vec<LyricLine>> {
     let mut bg_words = Vec::new();
     let mut bg_start_time = p_start_time;
     let mut bg_end_time = p_end_time;
-    
+
     while let Some(start) = remaining.find("<span") {
         let span_str = &remaining[start..];
         let tag_end = span_str.find('>').context("span has no closing >")?;
         let tag_full = &span_str[..tag_end + 1];
-        
+
         let is_bg = tag_full.contains(r#"ttm:role="x-bg""#);
-        
+
         if is_bg {
             if in_bg && !bg_words.is_empty() {
                 bg_lines.push(LyricLine {
@@ -123,31 +139,29 @@ fn parse_ttml_p(s: &str) -> Result<Vec<LyricLine>> {
                     agent: agent.clone(),
                 });
             }
-            
+
             in_bg = true;
             bg_words = Vec::new();
-            
-            bg_start_time = extract_attr(tag_full, "begin")
-                .and_then(|v| parse_time(v).ok())
-                .unwrap_or(p_start_time);
-            bg_end_time = extract_attr(tag_full, "end")
-                .and_then(|v| parse_time(v).ok())
-                .unwrap_or(p_end_time);
-            
+
+            bg_start_time = extract_attr(tag_full, "begin").and_then(|v| parse_time(v).ok()).unwrap_or(p_start_time);
+            bg_end_time = extract_attr(tag_full, "end").and_then(|v| parse_time(v).ok()).unwrap_or(p_end_time);
+
             remaining = &remaining[start + tag_end + 1..];
         } else {
             let span_end = span_str.find("</span>").context("span has no closing tag")? + 7;
             let full_span = &span_str[..span_end];
-            
+
             if in_bg {
-                let default_time = bg_words.last().map(|w: &LyricWord| (w.end_time, w.end_time))
+                let default_time = bg_words
+                    .last()
+                    .map(|w: &LyricWord| (w.end_time, w.end_time))
                     .or(Some((bg_start_time, bg_end_time)));
                 if let Ok(word) = parse_ttml_span(full_span, default_time) {
                     let mut clean_word = word;
                     clean_word.text = clean_word.text.replace(['(', ')'], "");
                     bg_words.push(clean_word);
                 }
-                
+
                 let after_span = &remaining[start + span_end..];
                 if after_span.starts_with("</span>") {
                     if !bg_words.is_empty() {
@@ -177,7 +191,9 @@ fn parse_ttml_p(s: &str) -> Result<Vec<LyricLine>> {
                     remaining = trimmed;
                 }
             } else {
-                let default_time = main_words.last().map(|w: &LyricWord| (w.end_time, w.end_time))
+                let default_time = main_words
+                    .last()
+                    .map(|w: &LyricWord| (w.end_time, w.end_time))
                     .or(Some((p_start_time, p_end_time)));
                 if let Ok(word) = parse_ttml_span(full_span, default_time) {
                     main_words.push(word);
@@ -198,7 +214,7 @@ fn parse_ttml_p(s: &str) -> Result<Vec<LyricLine>> {
             }
         }
     }
-    
+
     if in_bg && !bg_words.is_empty() {
         bg_lines.push(LyricLine {
             words: bg_words,
@@ -208,7 +224,7 @@ fn parse_ttml_p(s: &str) -> Result<Vec<LyricLine>> {
             agent: agent.clone(),
         });
     }
-    
+
     let mut result = Vec::new();
     if !main_words.is_empty() {
         let mut main_end_time = p_end_time;
@@ -223,7 +239,7 @@ fn parse_ttml_p(s: &str) -> Result<Vec<LyricLine>> {
             agent,
         });
     }
-    
+
     result.extend(bg_lines);
     Ok(result)
 }
@@ -231,7 +247,7 @@ fn parse_ttml_p(s: &str) -> Result<Vec<LyricLine>> {
 pub fn parse_ttml(source: &str) -> Result<Lyrics> {
     let mut lyrics = Vec::new();
     let mut remaining = source;
-    
+
     while let Some(start) = remaining.find("<p ") {
         let p_end = remaining[start..].find("</p>").context("p has no closing tag")? + 4;
         let p_str = &remaining[start..start + p_end];
@@ -240,31 +256,31 @@ pub fn parse_ttml(source: &str) -> Result<Lyrics> {
         }
         remaining = &remaining[start + p_end..];
     }
-    
+
     lyrics.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
     Ok(lyrics)
 }
 
 pub fn parse_lrc(source: &str) -> Result<Lyrics> {
     let mut lyrics = Vec::new();
-    
+
     for line in source.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('[') && !line.contains(']') {
             continue;
         }
-        
+
         let mut remaining = line;
         let mut times = Vec::new();
         let mut contents = Vec::new();
-        
+
         while let Some(start) = remaining.find('[') {
             let end = remaining[start..].find(']').context("timestamp not closed")?;
             let timestamp = &remaining[start + 1..start + end];
-            
+
             if let Ok(time) = parse_time(timestamp) {
                 times.push(time);
-                
+
                 let content_start = start + end + 1;
                 let content = if let Some(next_bracket) = remaining[content_start..].find('[') {
                     &remaining[content_start..content_start + next_bracket]
@@ -273,29 +289,29 @@ pub fn parse_lrc(source: &str) -> Result<Lyrics> {
                 };
                 contents.push(content.to_string());
             }
-            
+
             remaining = &remaining[start + end + 1..];
         }
-        
+
         if times.is_empty() {
             continue;
         }
-        
+
         let mut words = Vec::new();
         let line_start = times[0];
-        
+
         if times.len() > 1 {
             for i in 0..times.len() {
                 let start_time = times[i];
                 let end_time = times.get(i + 1).copied().unwrap_or(start_time + 2.0);
-                
+
                 let content = &contents[i];
                 let chars: Vec<char> = content.chars().collect();
-                
+
                 if chars.is_empty() {
                     continue;
                 }
-                
+
                 for (j, c) in chars.iter().enumerate() {
                     let char_start = start_time + j as f64 * (end_time - start_time) / chars.len() as f64;
                     let char_end = if j == chars.len() - 1 {
@@ -303,7 +319,7 @@ pub fn parse_lrc(source: &str) -> Result<Lyrics> {
                     } else {
                         char_start + (end_time - start_time) / chars.len() as f64
                     };
-                    
+
                     words.push(LyricWord {
                         text: c.to_string(),
                         start_time: char_start,
@@ -311,7 +327,7 @@ pub fn parse_lrc(source: &str) -> Result<Lyrics> {
                     });
                 }
             }
-            
+
             let line_end = times.last().copied().unwrap_or(line_start + 2.0);
             lyrics.push(LyricLine {
                 words,
@@ -322,11 +338,11 @@ pub fn parse_lrc(source: &str) -> Result<Lyrics> {
             });
         } else {
             let content = contents.join("").trim().to_string();
-            
+
             if content.is_empty() {
                 continue;
             }
-            
+
             lyrics.push(LyricLine {
                 words: vec![LyricWord {
                     text: content,
@@ -340,12 +356,12 @@ pub fn parse_lrc(source: &str) -> Result<Lyrics> {
             });
         }
     }
-    
+
     lyrics.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap_or(std::cmp::Ordering::Equal));
-    
+
     for i in 0..lyrics.len() - 1 {
         let next_start = lyrics[i + 1].start_time;
-        
+
         if lyrics[i].end_time <= lyrics[i].start_time {
             lyrics[i].end_time = next_start;
             for word in &mut lyrics[i].words {
@@ -360,7 +376,7 @@ pub fn parse_lrc(source: &str) -> Result<Lyrics> {
             }
         }
     }
-    
+
     Ok(lyrics)
 }
 

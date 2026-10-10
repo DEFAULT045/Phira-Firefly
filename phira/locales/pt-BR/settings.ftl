@@ -6,6 +6,7 @@ audio = Audio
 chart = Beatmap
 debug = Depurar
 about = Informações
+theme = Tema
 
 item-lang = Linguagem
 item-offline = Modo offline
@@ -15,6 +16,24 @@ item-mp-sub = Ativar o modo multijogador
 item-mp-addr = Servidor multijogador
 item-mp-addr-sub = Endereço do servidor, 'host:porta'
 item-mp-addr-invalid = Endereço de servidor inválido
+mp-server-page = Servidores multijogador
+mp-server-none = Nenhum servidor selecionado
+mp-server-current = Atual
+mp-server-name-title = Nome do servidor
+mp-server-name-prompt = Insira uma observação para este servidor.
+mp-server-name-empty = O nome do servidor não pode ficar vazio.
+mp-server-address-title = Endereço do servidor
+mp-server-address-prompt = Insira um endereço host:porta.
+mp-server-address-duplicate = Este endereço de servidor já existe.
+mp-server-added = Endereço do servidor adicionado.
+mp-server-name-updated = Nome do servidor atualizado.
+mp-server-address-updated = Endereço do servidor atualizado.
+mp-server-deleted = Endereço do servidor excluído.
+mp-server-selected = Endereço do servidor selecionado.
+mp-server-rename = Renomear
+mp-server-edit-address = Editar endereço
+mp-server-delete = Excluir
+mp-server-delete-confirm = Excluir este servidor multijogador?
 item-lowq = Modo de baixa qualidade
 item-lowq-sub = Habilite isto se a UI estiver lenta
 item-insecure = Modo inseguro
@@ -84,3 +103,11 @@ about-content =
   { $localization }
 
   E muitos outros revisores de charts voluntários. Para uma lista completa, consulte https://phira.moe/staff
+
+item-render-backend = Render Backend
+item-render-backend-sub = Requires restart to take effect
+item-render-backend-auto = Auto
+item-render-backend-wgpu = Vulkan
+item-render-backend-opengl = OpenGL
+item-perf-monitor = Monitor de desempenho
+item-perf-monitor-sub = Mostrar FPS/CPU/Memória/GPU/Disco no canto superior esquerdo

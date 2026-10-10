@@ -1,6 +1,6 @@
 prpr_l10n::tl_file!("cali");
 
-use std::{borrow::Cow, path::Path};
+use std::borrow::Cow;
 
 use super::{Page, SharedState};
 use crate::{get_data, get_data_mut, save_data};
@@ -9,7 +9,7 @@ use macroquad::prelude::*;
 use prpr::{
     core::{ParticleEmitter, ResourcePack, NOTE_WIDTH_RATIO_BASE},
     ext::{create_audio_manger, poll_future, semi_black, LocalTask, RectExt, SafeTexture, ScaleType},
-    fs::{self, FileSystem},
+    fs,
     scene::{show_error, BasicPlayer, GameMode, LoadingScene, NextScene},
     time::TimeManager,
     ui::{DRectButton, Slider, Ui},
@@ -45,13 +45,13 @@ impl OffsetPage {
     pub async fn new() -> Result<Self> {
         let mut audio = create_audio_manger(&get_data().config)?;
         let cali = audio.create_music(
-            AudioClip::new(load_file("cali.ogg").await?)?,
+            AudioClip::new(prpr::theme::load_asset_file("cali.ogg").await?)?,
             MusicParams {
                 loop_mix_time: 0.,
                 ..Default::default()
             },
         )?;
-        let cali_hit = audio.create_sfx(AudioClip::new(load_file("cali_hit.ogg").await?)?, None)?;
+        let cali_hit = audio.create_sfx(AudioClip::new(prpr::theme::load_asset_file("cali_hit.ogg").await?)?, None)?;
 
         let mut tm = TimeManager::new(1., true);
         tm.force = 3e-2;
@@ -131,7 +131,7 @@ impl Page for OffsetPage {
         if self.trial_btn.touch(touch, t) {
             let _ = self.cali.pause();
             self.trial_task = Some(Box::pin(async move {
-                let mut fs = fs::fs_from_file(Path::new("assets/offsettrial"))?;
+                let mut fs = fs::fs_from_assets("offsettrial/")?;
                 let mut info = fs::load_info(fs.as_mut()).await?;
                 let mut config = get_data().config.clone();
                 config.mods = Default::default();
@@ -142,18 +142,7 @@ impl Page for OffsetPage {
                     rks: it.rks,
                     historic_best: 0,
                 });
-                let scene = LoadingScene::new(
-                    GameMode::OffsetTrial,
-                    info,
-                    config,
-                    fs,
-                    player,
-                    None,
-                    None,
-                    None,
-                    Some(preload),
-                )
-                .await?;
+                let scene = LoadingScene::new(GameMode::OffsetTrial, info, config, fs, player, None, None, None, false, None, None, Some(preload)).await?;
                 Ok(NextScene::Overlay(Box::new(scene)))
             }));
             return Ok(true);
@@ -190,6 +179,18 @@ impl Page for OffsetPage {
     }
 
     fn render(&mut self, ui: &mut Ui, s: &mut SharedState) -> Result<()> {
+        if prpr::ui::PREFER_ALT_UI.load(std::sync::atomic::Ordering::Relaxed) {
+            let top = ui.top;
+            let title = ui.text("Offset")
+                .pos(-0.9, -top + 0.10)
+                .anchor(0., 0.5).no_baseline().size(0.9)
+                .color(Color::new(1.0, 0.93, 0.96, 1.0)).draw();
+            ui.text("\u{2665}")
+                .pos(title.right() + 0.028, title.center().y)
+                .anchor(0., 0.5).no_baseline().size(0.5)
+                .color(Color::new(1.0, 0.58, 0.706, 1.0)).draw();
+            ui.fill_rect(Rect::new(-0.9, -top + 0.012, 0.13, 0.006), Color::new(1.0, 0.58, 0.706, 0.9));
+        }
         let t = s.t;
         s.render_fader(ui, |ui| {
             let lf = -0.92;

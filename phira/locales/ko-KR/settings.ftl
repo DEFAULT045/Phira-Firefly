@@ -6,6 +6,7 @@ audio = 오디오
 chart = 비트맵
 debug = 디버그
 about = 정보
+theme = 테마
 
 item-lang = 언어
 item-offline = 오프라인 모드
@@ -18,6 +19,24 @@ item-mp-sub = 멀티플레이어 모드 활성화
 item-mp-addr = 멀티플레이어 서버
 item-mp-addr-sub = 서버 주소, '호스트:포트'
 item-mp-addr-invalid = 잘못된 서버 주소
+mp-server-page = 멀티플레이 서버
+mp-server-none = 선택한 서버 없음
+mp-server-current = 현재
+mp-server-name-title = 서버 이름
+mp-server-name-prompt = 이 서버의 메모를 입력하세요.
+mp-server-name-empty = 서버 이름은 비워 둘 수 없습니다.
+mp-server-address-title = 서버 주소
+mp-server-address-prompt = host:port 주소를 입력하세요.
+mp-server-address-duplicate = 이 서버 주소는 이미 있습니다.
+mp-server-added = 서버 주소를 추가했습니다.
+mp-server-name-updated = 서버 이름을 업데이트했습니다.
+mp-server-address-updated = 서버 주소를 업데이트했습니다.
+mp-server-deleted = 서버 주소를 삭제했습니다.
+mp-server-selected = 서버 주소를 선택했습니다.
+mp-server-rename = 이름 변경
+mp-server-edit-address = 주소 수정
+mp-server-delete = 삭제
+mp-server-delete-confirm = 이 멀티플레이 서버를 삭제할까요?
 item-lowq = 저화질 모드
 item-lowq-sub = UI가 느릴 때 이 기능을 활성화하세요.
 item-insecure = 보안 모드 끄기
@@ -92,3 +111,11 @@ about-content =
   { $localization }
 
   그리고 많은 자원봉사 채보 리뷰어들에게 감사드립니다. 전체 목록은 https://phira.moe/staff 를 참조하세요.
+
+item-render-backend = Render Backend
+item-render-backend-sub = Requires restart to take effect
+item-render-backend-auto = Auto
+item-render-backend-wgpu = Vulkan
+item-render-backend-opengl = OpenGL
+item-perf-monitor = 성능 모니터
+item-perf-monitor-sub = 게임 내 좌측 상단에 FPS/CPU/메모리/GPU/디스크 사용량 표시

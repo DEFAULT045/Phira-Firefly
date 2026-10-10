@@ -9,11 +9,18 @@ pub use chapter::ChapterScene;
 pub(crate) mod event;
 pub use event::EventScene;
 
+pub(crate) mod boot;
+pub use boot::BootScene;
+
 mod main;
 pub use main::{MainScene, BGM_VOLUME_UPDATED, MP_PANEL};
 
 mod song;
 pub use song::{compress_folder, Downloading, SongScene, RECORD_ID};
+#[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32", target_env = "ohos")))]
+mod render;
+#[cfg(not(any(target_os = "android", target_os = "ios", target_arch = "wasm32", target_env = "ohos")))]
+pub use render::{RenderProgressScene, RenderSettingsScene};
 #[cfg(feature = "video")]
 mod unlock;
 #[cfg(feature = "video")]
@@ -24,6 +31,9 @@ pub use profile::ProfileScene;
 
 mod tutorial;
 pub use tutorial::TutorialLoadingScene;
+
+mod onboarding;
+pub use onboarding::OnboardingScene;
 
 use crate::{
     client::{Client, UserManager},

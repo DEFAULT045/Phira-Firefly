@@ -23,7 +23,7 @@ use std::{
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -99,8 +99,6 @@ pub struct ChartsView {
 
     pub can_refresh: bool,
 
-    pub clicked_special: bool,
-
     pub allow_edit: bool,
     editing_chart: Option<usize>,
     chart_menu: Popup,
@@ -109,6 +107,16 @@ pub struct ChartsView {
     movement: Option<(usize, usize)>,
 
     pub multi_select: Option<Vec<ChartRef>>,
+
+    
+    pub require_xcsim_login: bool,
+
+    
+    #[cfg(feature = "testing")]
+    pub lan_manager: Option<Arc<Mutex<crate::lan::LanManager>>>,
+    
+    #[cfg(feature = "testing")]
+    lan_panel: Option<crate::lan::LanPanel>,
 }
 
 impl ChartsView {
@@ -130,8 +138,6 @@ impl ChartsView {
 
             can_refresh: true,
 
-            clicked_special: false,
-
             allow_edit: false,
             editing_chart: None,
             chart_menu: Popup::new(),
@@ -139,7 +145,14 @@ impl ChartsView {
             edit_move_state: None,
             movement: None,
 
+            require_xcsim_login: false,
+
             multi_select: None,
+
+            #[cfg(feature = "testing")]
+            lan_manager: None,
+            #[cfg(feature = "testing")]
+            lan_panel: None,
         }
     }
 
@@ -193,11 +206,25 @@ impl ChartsView {
     }
 
     pub fn touch(&mut self, touch: &Touch, t: f32, rt: f32) -> Result<bool> {
+        
+        #[cfg(feature = "testing")]
+        if let Some(panel) = &mut self.lan_panel {
+            if panel.visible() {
+                return Ok(panel.touch(touch, t));
+            }
+        }
         if self.chart_menu.showing() {
             self.chart_menu.touch(touch, t);
             return Ok(true);
         }
         if self.scroll.touch(touch, t) {
+            
+            
+            if let Some(charts) = &mut self.charts {
+                for item in charts.iter_mut() {
+                    item.long_touch.reset();
+                }
+            }
             return Ok(true);
         }
         if !self.scroll.contains(touch) {
@@ -209,21 +236,30 @@ impl ChartsView {
                 if let Some(chart) = &item.chart {
                     if item.btn.touch(touch, t) {
                         item.long_touch.reset();
-                        let handled_by_mp = MP_PANEL.with(|it| {
-                            if let Some(panel) = it.borrow_mut().as_mut() {
-                                if panel.in_room() {
-                                    if let Some(id) = chart.info.id {
-                                        panel.select_chart(id);
-                                        panel.show(rt);
-                                    } else {
-                                        use crate::mp::{mtl, L10N_LOCAL};
-                                        show_message(mtl!("select-chart-local")).error();
-                                    }
-                                    return true;
-                                }
-                            }
+                        let handled_by_mp = if self.require_xcsim_login {
+                            
                             false
-                        });
+                        } else {
+                            MP_PANEL.with(|it| {
+                                if let Some(panel) = it.borrow_mut().as_mut() {
+                                    if panel.in_room() {
+                                        if let Some(id) = chart.info.id {
+                                            panel.select_chart(id);
+                                            panel.show(rt);
+                                        } else {
+                                            
+                                            panel.select_local_chart(
+                                                chart.local_path.clone().unwrap_or_default(),
+                                                chart.info.name.clone(),
+                                            );
+                                            panel.show(rt);
+                                        }
+                                        return true;
+                                    }
+                                }
+                                false
+                            })
+                        };
                         if handled_by_mp {
                             button_hit_large();
                             continue;
@@ -263,27 +299,64 @@ impl ChartsView {
                         }
 
                         button_hit_large();
-                        let download_path = chart.info.id.map(|it| format!("download/{it}"));
-                        let scene = SongScene::new(
-                            chart.clone(),
-                            if let Some(path) = &chart.local_path {
-                                Some(path.clone())
+                        
+                        if self.require_xcsim_login && chart.local_path.is_none() && !crate::client::xcsim::is_logged_in() {
+                            show_message(tl!("xcsim-need-login")).error();
+                            continue;
+                        }
+                        
+                        let download_path = chart.info.id.map(|it| {
+                            if self.require_xcsim_login {
+                                format!("xcsim/{it}")
                             } else {
-                                let path = download_path.clone().unwrap();
-                                if Path::new(&format!("{}/{path}", dir::charts()?)).exists() {
-                                    Some(path)
+                                format!("download/{it}")
+                            }
+                        });
+                        let scene = if self.require_xcsim_login {
+                            SongScene::new_xcsim(
+                                chart.clone(),
+                                if let Some(path) = &chart.local_path {
+                                    Some(path.clone())
                                 } else {
-                                    None
-                                }
-                            },
-                            Arc::clone(&self.icons),
-                            self.rank_icons.clone(),
-                            chart
-                                .local_path
-                                .as_ref()
-                                .and_then(|path| get_data().charts.iter().find(|it| &it.local_path == path).map(|it| it.mods))
-                                .unwrap_or_default(),
-                        );
+                                    let path = download_path.clone().unwrap();
+                                    if Path::new(&format!("{}/{path}", dir::charts()?)).exists() {
+                                        Some(path)
+                                    } else {
+                                        None
+                                    }
+                                },
+                                Arc::clone(&self.icons),
+                                self.rank_icons.clone(),
+                                chart
+                                    .local_path
+                                    .as_ref()
+                                    .and_then(|path| get_data().charts.iter().find(|it| &it.local_path == path).map(|it| it.mods))
+                                    .unwrap_or_default(),
+                                true,
+                            )
+                        } else {
+                            SongScene::new(
+                                chart.clone(),
+                                if let Some(path) = &chart.local_path {
+                                    Some(path.clone())
+                                } else {
+                                    let path = download_path.clone().unwrap();
+                                    if Path::new(&format!("{}/{path}", dir::charts()?)).exists() {
+                                        Some(path)
+                                    } else {
+                                        None
+                                    }
+                                },
+                                Arc::clone(&self.icons),
+                                self.rank_icons.clone(),
+                                chart
+                                    .local_path
+                                    .as_ref()
+                                    .and_then(|path| get_data().charts.iter().find(|it| &it.local_path == path).map(|it| it.mods))
+                                    .unwrap_or_default(),
+                            )
+                        };
+                        prpr::ui::chart_preview_sfx();
                         self.transit = Some(TransitState {
                             id: id as _,
                             rect: None,
@@ -313,11 +386,6 @@ impl ChartsView {
                         self.need_show_chart_menu = true;
                         return Ok(true);
                     }
-                } else if item.btn.touch(touch, t) {
-                    self.editing_chart = None;
-                    self.edit_move_state = None;
-                    button_hit_large();
-                    self.clicked_special = true;
                 }
             }
         }
@@ -343,7 +411,42 @@ impl ChartsView {
         self.charts.as_ref().is_some_and(|it| it.first().is_some_and(|item| item.chart.is_none()))
     }
 
+    
+    pub fn show_chart_menu_with_lan(&mut self, ui: &mut Ui, t: f32, chart_index: usize) {
+        if self.editing_chart == Some(chart_index) && self.need_show_chart_menu {
+            self.need_show_chart_menu = false;
+            self.chart_menu.set_auto_adjust(Some(ui.screen_rect().nonuniform_feather(-0.03, -0.05)));
+            
+            let mut options = vec![
+                tl!("select").into_owned(),
+                #[cfg(feature = "testing")]
+                tl!("lan-multiplayer").into_owned(),
+            ];
+            
+            if self.allow_edit {
+                options.extend([
+                    tl!("move-to-first").into_owned(),
+                    tl!("move-to-last").into_owned(),
+                    tl!("move-before").into_owned(),
+                    tl!("move-after").into_owned(),
+                ]);
+            }
+            
+            self.chart_menu.set_options(options);
+            self.chart_menu.show(ui, t, Rect::new(0.35, 0.35, 0.3, 0.4));
+        }
+    }
+
     pub fn update(&mut self, t: f32) -> Result<bool> {
+        
+        #[cfg(feature = "testing")]
+        if let Some(panel) = &mut self.lan_panel {
+            if panel.visible() {
+                panel.update(t)?;
+                
+                return Ok(false);
+            }
+        }
         let refreshed = self.can_refresh && self.scroll.y_scroller.pulled;
         self.chart_menu.update(t);
         self.scroll.update(t);
@@ -354,6 +457,8 @@ impl ChartsView {
                         self.scroll.y_scroller.halt();
                         self.editing_chart = Some(id);
                         let mut options = vec![tl!("select").into_owned()];
+                        #[cfg(feature = "testing")]
+                        options.push(tl!("lan-multiplayer").into_owned());
                         if self.allow_edit {
                             options.extend([
                                 tl!("move-to-first").into_owned(),
@@ -373,27 +478,37 @@ impl ChartsView {
         if self.chart_menu.changed() {
             let has_header = self.has_header();
             let editing = self.editing_chart.unwrap();
+            
+            let move_start = if cfg!(feature = "testing") { 2 } else { 1 };
             match self.chart_menu.selected() {
                 0 => {
                     let chart = self.charts.as_ref().unwrap()[editing].chart.as_ref().unwrap();
                     self.multi_select = Some([chart.to_bare_ref()].into());
                 }
-                1 => {
+                #[cfg(feature = "testing")]
+                n if n == move_start - 1 => {
+                    
+                    if let Some(manager) = self.lan_manager.clone() {
+                        let panel = self.lan_panel.get_or_insert_with(|| crate::lan::LanPanel::new(manager));
+                        panel.show(t);
+                    }
+                }
+                n if n == move_start => {
                     self.movement = Some((editing - has_header as usize, 0));
                     if let Some(charts) = &mut self.charts {
                         let chart = charts.remove(editing);
                         charts.insert(has_header as usize, chart);
                     }
                 }
-                2 => {
+                n if n == move_start + 1 => {
                     self.movement = Some((editing - has_header as usize, self.charts.as_ref().unwrap().len() - 1 - has_header as usize));
                     if let Some(charts) = &mut self.charts {
                         let chart = charts.remove(editing);
                         charts.push(chart);
                     }
                 }
-                3 | 4 => {
-                    self.edit_move_state = Some(self.chart_menu.selected() == 4);
+                n if n == move_start + 2 || n == move_start + 3 => {
+                    self.edit_move_state = Some(self.chart_menu.selected() == move_start + 3);
                     show_message(tl!("choose-target"));
                 }
                 _ => {}
@@ -491,7 +606,8 @@ impl ChartsView {
                             let item = &mut charts[id as usize];
 
                             item.btn.render_shadow(ui, r, t, |ui, path| {
-                                let selected_color = Color::from_rgba(30, 136, 229, 255);
+                                let xchs = prpr::ui::PREFER_ALT_UI.load(std::sync::atomic::Ordering::Relaxed);
+                            let selected_color = if xchs { Color::from_rgba(255, 148, 180, 255) } else { Color::from_rgba(30, 136, 229, 255) };
 
                                 if let Some(chart) = &mut item.chart {
                                     let selected = self.multi_select.as_ref().and_then(|set| {
@@ -555,6 +671,24 @@ impl ChartsView {
                                             .color(c)
                                             .draw();
                                     }
+                                    
+                                    if chart
+                                        .local_path
+                                        .as_deref()
+                                        .is_some_and(|p| p.starts_with("xcsim/"))
+                                    {
+                                        let m = ui
+                                            .text("XC-SIM")
+                                            .pos(r.x + 0.01, r.y + 0.01)
+                                            .size(0.52 * r.w / cw)
+                                            .measure();
+                                        ui.fill_path(&m.feather(0.006).rounded(0.01), Color { a: 0.9, ..WHITE });
+                                        ui.text("XC-SIM")
+                                            .pos(r.x + 0.01, r.y + 0.01)
+                                            .size(0.52 * r.w / cw)
+                                            .color(BLACK)
+                                            .draw();
+                                    }
 
                                     if let Some(pos) = selected {
                                         ui.fill_path(&path, Color { a: 0.4, ..selected_color });
@@ -586,6 +720,14 @@ impl ChartsView {
             });
         });
         self.chart_menu.render(ui, t, 1.);
+
+        
+        #[cfg(feature = "testing")]
+        if let Some(panel) = &mut self.lan_panel {
+            if panel.visible() {
+                panel.render(ui, t);
+            }
+        }
     }
 
     pub fn render_top(&mut self, ui: &mut Ui, t: f32) {
